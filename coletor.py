@@ -32,7 +32,7 @@ Dependencia: psycopg. Ver requirements.txt.
 """
 
 from urllib.request import urlopen, Request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import sys
@@ -69,7 +69,12 @@ HEADERS = {
 # Slug da usina deste coletor (deve existir na tabela 'usina')
 USINA_SLUG = "pk"
 
+# Fuso do Brasil (a Chint publica no fuso de Sao Paulo conforme o header
+# 'time-zone' que enviamos; o Railway roda em UTC, entao precisamos converter)
+FUSO_BR = timezone(timedelta(hours=-3))
+
 # ---- indices dos campos na resposta da API Chint ----
+IDX_DATE   = 0           # carimbo da Chint, ex: "2026-05-27 13:45:16"
 IDX_TYIELD = 4
 IDX_DYIELD = 5
 IDX_PAC    = 10
@@ -97,20 +102,49 @@ def safe_float(val):
         return 0.0
 
 
-def slot_5min(dt):
-    """Arredonda (trunca) o datetime para o multiplo de 5 minutos."""
+def slot_alvo(agora_br):
+    """Dado o 'agora' no fuso BR, retorna o slot multiplo de 5 anterior.
+    Ex.: 13:47:23 -> 13:45:00. Segundos e microssegundos zerados."""
+    minuto = (agora_br.minute // 5) * 5
+    return agora_br.replace(minute=minuto, second=0, microsecond=0)
+
+
+def truncar_slot_5min(dt):
+    """Trunca um datetime para o multiplo de 5 min anterior, segundos = 0.
+    Usado para alinhar o carimbo da Chint (ex: 13:45:16) ao slot (13:45:00)."""
     minuto = (dt.minute // 5) * 5
     return dt.replace(minute=minuto, second=0, microsecond=0)
 
 
-def buscar_inversor(asset_id):
-    """Busca a leitura mais recente de um inversor na API da Chint.
-    Retorna a row (lista) ou None. Pode levantar excecao em erro de rede."""
-    hoje = datetime.now().strftime("%Y-%m-%d")
+def parse_data_chint(texto):
+    """Converte 'AAAA-MM-DD HH:MM:SS' em datetime. None se falhar."""
+    if not texto:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(texto, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def buscar_inversor(asset_id, alvo_br):
+    """Busca na API da Chint a leitura cujo carimbo, truncado para 5 min,
+    coincide com 'alvo_br' (slot que queremos preencher).
+
+    Retorna (row, ts_chint) ou (None, None) se nao houver leitura para o
+    slot. 'ts_chint' e o datetime original devolvido pela Chint (segundos
+    incluidos); o slot truncado e calculado novamente em main().
+
+    Estrategia: pede as ultimas 10 leituras do dia (limit=10) e varre.
+    A Chint pode publicar a leitura de 13:45 com alguns segundos de atraso,
+    entao se o cron rodou as 13:47 e ela ainda nao publicou, a leitura
+    nao estara na lista e devolvemos None — o proximo ciclo pega."""
+    dia = alvo_br.strftime("%Y-%m-%d")
     url = (
         f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
-        f"?assetId={asset_id}&startDay={hoje}&endDay={hoje}"
-        f"&dataType=&lang=pt-PT&page=1&limit=1"
+        f"?assetId={asset_id}&startDay={dia}&endDay={dia}"
+        f"&dataType=&lang=pt-PT&page=1&limit=10"
     )
     req  = Request(url, headers=HEADERS)
     resp = urlopen(req, timeout=20)
@@ -118,7 +152,26 @@ def buscar_inversor(asset_id):
     if data.get("code") != "0":
         raise ValueError(f"API Chint retornou erro: {data.get('msg')}")
     rows = data.get("data", {}).get("dataList") or []
-    return rows[0] if rows else None
+
+    for row in rows:
+        if not row:
+            continue
+        ts = parse_data_chint(row[IDX_DATE]) if IDX_DATE < len(row) else None
+        if ts is None:
+            continue
+
+        # A Chint as vezes publica leituras "fora-de-grid" (ex: 11:07:24).
+        # So aceitamos leituras cujo MINUTO seja multiplo exato de 5; as
+        # fora-de-grid sao ignoradas (o usuario confirmou que sao raras).
+        if ts.minute % 5 != 0:
+            continue
+
+        # Compara o slot da leitura (minuto+hora+dia) com o alvo.
+        slot_leitura = ts.replace(second=0, microsecond=0)
+        if slot_leitura == alvo_br.replace(tzinfo=None):
+            return row, ts
+
+    return None, None
 
 
 def extrair_dados(row, topologia):
@@ -310,9 +363,15 @@ def gravar_leitura(cur, inversor_id, ts, status, campos, mppts, strings):
 # ============================================================
 
 def main():
-    ts = slot_5min(datetime.now())
+    # 'agora' no fuso do Brasil — o Railway roda em UTC.
+    # Isso corrige o bug latente da janela 21h-00h, em que datetime.now()
+    # do servidor virava o dia antes do Brasil.
+    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
+    alvo = slot_alvo(agora_br)
+
     print("=" * 60)
-    print(f"COLETOR v2 APOLO SOLAR — {ts:%Y-%m-%d %H:%M}")
+    print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} "
+          f"(BR) | slot alvo {alvo:%H:%M}")
 
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15)
     try:
@@ -345,6 +404,7 @@ def main():
 
         total_pac = 0.0
         n_online  = 0
+        n_pulado  = 0
         n_erro    = 0
 
         for inv_id, nome, asset_id, modelo_id in inversores:
@@ -355,36 +415,40 @@ def main():
                 continue
 
             try:
-                row = buscar_inversor(asset_id)
+                row, ts_chint = buscar_inversor(asset_id, alvo)
             except Exception as e:
                 print(f"  [{nome}] ERRO de API: {e}")
-                campos, mppts, strings = canais_zerados(topo)
-                gravar_leitura(cur, inv_id, ts, "ERRO",
-                               campos, mppts, strings)
                 n_erro += 1
                 continue
 
             if row is None:
-                print(f"  [{nome}] SEM_DADOS")
-                campos, mppts, strings = canais_zerados(topo)
-                gravar_leitura(cur, inv_id, ts, "SEM_DADOS",
-                               campos, mppts, strings)
+                # A Chint ainda nao publicou a leitura deste slot. Nao gravamos
+                # nada — o proximo ciclo do cron pega esse slot, sem poluir o
+                # banco com SEM_DADOS.
+                print(f"  [{nome}] aguardando slot {alvo:%H:%M} (Chint ainda nao publicou)")
+                n_pulado += 1
                 continue
 
+            # Grava usando o timestamp da Chint truncado para o slot (segundos=0).
+            # O UNIQUE(inversor_id, data_hora) garante que nao haja duplicacao.
+            ts_grava = truncar_slot_5min(ts_chint)
+
             status, campos, mppts, strings = extrair_dados(row, topo)
-            gravar_leitura(cur, inv_id, ts, status,
+            gravar_leitura(cur, inv_id, ts_grava, status,
                            campos, mppts, strings)
             total_pac += campos["pac_kw"]
             if status == "ONLINE":
                 n_online += 1
-            print(f"  [{nome}] {status} | Pac: {campos['pac_kw']:.2f} kW")
+            print(f"  [{nome}] {status} | {ts_chint:%H:%M:%S} -> {ts_grava:%H:%M} | "
+                  f"Pac: {campos['pac_kw']:.2f} kW")
 
         # Confirma TODAS as gravacoes do ciclo de uma vez
         conn.commit()
         print("-" * 60)
         print(f"  Potencia total: {total_pac:.2f} kW | "
-              f"Online: {n_online}/{len(inversores)} | Erros: {n_erro}")
-        print("  Ciclo gravado com sucesso.")
+              f"Online: {n_online}/{len(inversores)} | "
+              f"Aguardando: {n_pulado} | Erros: {n_erro}")
+        print("  Ciclo concluido.")
 
     except Exception as e:
         conn.rollback()
