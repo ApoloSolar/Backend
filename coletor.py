@@ -363,99 +363,76 @@ def gravar_leitura(cur, inversor_id, ts, status, campos, mppts, strings):
 # ============================================================
 
 def main():
-    # 'agora' no fuso do Brasil — o Railway roda em UTC.
-    # Isso corrige o bug latente da janela 21h-00h, em que datetime.now()
-    # do servidor virava o dia antes do Brasil.
-    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
-    alvo = slot_alvo(agora_br)
-
+    """COLETOR DE DEBUG — nao grava no banco.
+    Pega um inversor da usina, busca na Chint, loga as 5 primeiras
+    posicoes da row para descobrir em qual delas esta a data.
+    """
     print("=" * 60)
-    print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} "
-          f"(BR) | slot alvo {alvo:%H:%M}")
+    print("COLETOR DEBUG — descobrindo o indice da Date")
+    print("=" * 60)
 
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15)
     try:
         cur = conn.cursor()
-
-        # Carrega as topologias de todos os modelos cadastrados
-        topologias = carregar_topologias(cur)
-        if not topologias:
-            print("ERRO: nenhum modelo de inversor cadastrado.")
-            print("Rode o schema_v2.sql no banco primeiro.")
-            sys.exit(1)
-
-        # Busca os inversores desta usina, com o modelo de cada um
         cur.execute(
-            """
-            SELECT i.id, i.nome, i.asset_id, i.modelo_id
-            FROM inversor i
-            JOIN usina u ON u.id = i.usina_id
-            WHERE u.slug = %s
-            ORDER BY i.idx
-            """,
+            "SELECT i.nome, i.asset_id FROM inversor i "
+            "JOIN usina u ON u.id = i.usina_id "
+            "WHERE u.slug = %s ORDER BY i.idx LIMIT 1",
             (USINA_SLUG,),
         )
-        inversores = cur.fetchall()
-
-        if not inversores:
-            print(f"ERRO: nenhum inversor para a usina '{USINA_SLUG}'.")
-            print("Rode o schema_v2.sql no banco primeiro.")
+        r = cur.fetchone()
+        if r is None:
+            print("ERRO: nenhum inversor cadastrado.")
             sys.exit(1)
-
-        total_pac = 0.0
-        n_online  = 0
-        n_pulado  = 0
-        n_erro    = 0
-
-        for inv_id, nome, asset_id, modelo_id in inversores:
-            topo = topologias.get(modelo_id)
-            if topo is None:
-                print(f"  [{nome}] ERRO: modelo {modelo_id} sem topologia.")
-                n_erro += 1
-                continue
-
-            try:
-                row, ts_chint = buscar_inversor(asset_id, alvo)
-            except Exception as e:
-                print(f"  [{nome}] ERRO de API: {e}")
-                n_erro += 1
-                continue
-
-            if row is None:
-                # A Chint ainda nao publicou a leitura deste slot. Nao gravamos
-                # nada — o proximo ciclo do cron pega esse slot, sem poluir o
-                # banco com SEM_DADOS.
-                print(f"  [{nome}] aguardando slot {alvo:%H:%M} (Chint ainda nao publicou)")
-                n_pulado += 1
-                continue
-
-            # Grava usando o timestamp da Chint truncado para o slot (segundos=0).
-            # O UNIQUE(inversor_id, data_hora) garante que nao haja duplicacao.
-            ts_grava = truncar_slot_5min(ts_chint)
-
-            status, campos, mppts, strings = extrair_dados(row, topo)
-            gravar_leitura(cur, inv_id, ts_grava, status,
-                           campos, mppts, strings)
-            total_pac += campos["pac_kw"]
-            if status == "ONLINE":
-                n_online += 1
-            print(f"  [{nome}] {status} | {ts_chint:%H:%M:%S} -> {ts_grava:%H:%M} | "
-                  f"Pac: {campos['pac_kw']:.2f} kW")
-
-        # Confirma TODAS as gravacoes do ciclo de uma vez
-        conn.commit()
-        print("-" * 60)
-        print(f"  Potencia total: {total_pac:.2f} kW | "
-              f"Online: {n_online}/{len(inversores)} | "
-              f"Aguardando: {n_pulado} | Erros: {n_erro}")
-        print("  Ciclo concluido.")
-
-    except Exception as e:
-        conn.rollback()
-        print(f"ERRO no ciclo — nada foi gravado: {e}")
-        sys.exit(1)
+        nome, asset_id = r
     finally:
         conn.close()
+
+    # Chama a Chint usando o dia de hoje no fuso BR
+    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
+    dia = agora_br.strftime("%Y-%m-%d")
+    print(f"Inversor escolhido: {nome}")
+    print(f"asset_id:           {asset_id}")
+    print(f"Buscando dia:       {dia}")
+    print(f"Agora (BR):         {agora_br:%Y-%m-%d %H:%M:%S}")
+    print()
+
+    url = (
+        f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
+        f"?assetId={asset_id}&startDay={dia}&endDay={dia}"
+        f"&dataType=&lang=pt-PT&page=1&limit=5"
+    )
+    try:
+        req = Request(url, headers=HEADERS)
+        resp = urlopen(req, timeout=20)
+        data = json.loads(resp.read())
+    except Exception as e:
+        print(f"ERRO chamando a Chint: {e}")
+        sys.exit(1)
+
+    if data.get("code") != "0":
+        print(f"Chint retornou erro: code={data.get('code')} msg={data.get('msg')}")
+        sys.exit(1)
+
+    rows = data.get("data", {}).get("dataList") or []
+    print(f"Chint devolveu {len(rows)} leitura(s).")
+    print()
+
+    if not rows:
+        print("AVISO: lista vazia. Sem dados para inspecionar.")
+        sys.exit(0)
+
+    # Loga as primeiras 5 posicoes de cada uma das (ate) 3 primeiras rows
+    for i, row in enumerate(rows[:3]):
+        print(f"--- Leitura #{i+1} (total {len(row)} campos) ---")
+        for k in range(min(8, len(row))):
+            valor = row[k]
+            # Marca com asterisco se parece com uma data
+            marca = ""
+            if isinstance(valor, str) and len(valor) >= 16 and valor[4] == '-':
+                marca = "  <-- parece data"
+            print(f"  [{k}] {valor!r}{marca}")
+        print()
 
 
 if __name__ == "__main__":
