@@ -35,6 +35,7 @@ from urllib.request import urlopen, Request
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import sys
 
 import psycopg
@@ -117,25 +118,48 @@ def truncar_slot_5min(dt):
 
 
 def parse_data_chint(texto):
-    """Converte texto de data em datetime. None se falhar.
+    """Converte texto de data em datetime EM UTC (naive). None se falhar.
+
     Aceita os formatos que a Chint usa atualmente:
-      'AAAA-MM-DD HH:MM:SS -0300'  (com offset, ex: '2026-05-27 14:15:16 -0300')
-      'AAAA-MM-DD HH:MM:SS'         (sem offset)
-      'AAAA-MM-DD HH:MM'            (sem segundos)
-    Quando ha offset, ele e removido e a data e tratada como sendo no fuso
-    do Brasil (que e o que pedimos a Chint via header time-zone)."""
+      'AAAA-MM-DD HH:MM:SS -0300'  (com offset)
+      'AAAA-MM-DD HH:MM:SS'         (sem offset, assume BR)
+      'AAAA-MM-DD HH:MM'            (sem segundos, assume BR)
+
+    O retorno e SEMPRE em UTC (sem tzinfo), para coerencia com o banco.
+    A API depois converte UTC -> BR para exibir."""
     if not texto:
         return None
     s = str(texto).strip()
-    # Remove offset tipo " -0300" ou " +0000" no final, caso exista
-    if len(s) >= 6 and s[-5] in ("+", "-") and s[-6] == " ":
-        s = s[:-6]
+
+    # Detecta offset no final do texto: " +HHMM" ou " -HHMM" (com ou sem espaco antes)
+    offset_presente = False
+    offset_hh = 0
+    offset_mm = 0
+    m = re.search(r'\s*([+-])(\d{2})(\d{2})\s*$', s)
+    if m:
+        offset_presente = True
+        sinal = -1 if m.group(1) == "-" else 1
+        offset_hh = sinal * int(m.group(2))
+        offset_mm = sinal * int(m.group(3))
+        s = s[:m.start()].strip()
+
+    dt_local = None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(s, fmt)
+            dt_local = datetime.strptime(s, fmt)
+            break
         except (ValueError, TypeError):
             continue
-    return None
+    if dt_local is None:
+        return None
+
+    # Se nao veio offset, assume que e BR (-3h) -- a Chint envia BR mesmo
+    # quando omite o offset, conforme o header time-zone que mandamos.
+    if not offset_presente:
+        offset_hh = -3
+
+    # Converte para UTC subtraindo o offset: BR (-3) -> +3h para virar UTC
+    return dt_local - timedelta(hours=offset_hh, minutes=offset_mm)
 
 
 def buscar_inversor(asset_id, alvo_br):
@@ -163,6 +187,9 @@ def buscar_inversor(asset_id, alvo_br):
         raise ValueError(f"API Chint retornou erro: {data.get('msg')}")
     rows = data.get("data", {}).get("dataList") or []
 
+    # Converte o alvo (BR) para UTC, ja que parse_data_chint retorna UTC
+    alvo_utc = (alvo_br + timedelta(hours=3)).replace(tzinfo=None)
+
     for row in rows:
         if not row:
             continue
@@ -173,12 +200,13 @@ def buscar_inversor(asset_id, alvo_br):
         # A Chint as vezes publica leituras "fora-de-grid" (ex: 11:07:24).
         # So aceitamos leituras cujo MINUTO seja multiplo exato de 5; as
         # fora-de-grid sao ignoradas (o usuario confirmou que sao raras).
+        # Obs: o minuto e preservado pela conversao para UTC (offset e horas).
         if ts.minute % 5 != 0:
             continue
 
-        # Compara o slot da leitura (minuto+hora+dia) com o alvo.
+        # Compara o slot da leitura (em UTC) com o alvo (tambem em UTC).
         slot_leitura = ts.replace(second=0, microsecond=0)
-        if slot_leitura == alvo_br.replace(tzinfo=None):
+        if slot_leitura == alvo_utc:
             return row, ts
 
     return None, None
@@ -440,6 +468,7 @@ def main():
                 continue
 
             # Grava usando o timestamp da Chint truncado para o slot (segundos=0).
+            # ts_chint vem em UTC (do parse_data_chint), gravamos em UTC.
             # O UNIQUE(inversor_id, data_hora) garante que nao haja duplicacao.
             ts_grava = truncar_slot_5min(ts_chint)
 
@@ -449,8 +478,11 @@ def main():
             total_pac += campos["pac_kw"]
             if status == "ONLINE":
                 n_online += 1
-            print(f"  [{nome}] {status} | {ts_chint:%H:%M:%S} -> {ts_grava:%H:%M} | "
-                  f"Pac: {campos['pac_kw']:.2f} kW")
+            # Mostra horarios em BR no log (mais facil de conferir com a Chint)
+            ts_chint_br = ts_chint - timedelta(hours=3)
+            ts_grava_br = ts_grava - timedelta(hours=3)
+            print(f"  [{nome}] {status} | Chint {ts_chint_br:%H:%M:%S} BR -> "
+                  f"slot {ts_grava_br:%H:%M} BR | Pac: {campos['pac_kw']:.2f} kW")
 
         # Confirma TODAS as gravacoes do ciclo de uma vez
         conn.commit()
