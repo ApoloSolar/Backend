@@ -422,48 +422,32 @@ def main():
         print("AVISO: lista vazia. Sem dados para inspecionar.")
         sys.exit(0)
 
-    # Loga TODOS os campos da leitura mais recente como TABELA
+    # Loga APENAS os campos 105-124 (a faixa que foi truncada nos logs
+    # anteriores). E onde devem estar Tmod, Tamb e ISO conforme valores
+    # ja conhecidos da Chint: Tmod=50,5°C, Tamb=43,8°C, ISO=434 kOhm.
     row = rows[0]
-
-    def hint(v):
-        """Retorna uma pista do que pode ser o valor, para ajudar o mapeamento."""
-        if isinstance(v, str):
-            if len(v) >= 16 and v[4:5] == '-':
-                return "data"
-            if v in ('Running', 'Standby', 'Fault', 'Stopped'):
-                return "status"
-            if v == '0000':
-                return "flag/alarme?"
-            return ""
-        try:
-            f = float(v)
-        except (ValueError, TypeError):
-            return ""
-        # heuristicas baseadas em faixas plausiveis
-        if 400 <= f <= 470:        return "<<<< candidato a ISO (~434 kOhm)"
-        if 950 <= f <= 1100:       return "tensao MPPT? (~1010 V)"
-        if 59.5 <= f <= 60.5:      return "frequencia? (~60 Hz)"
-        if 700000 <= f <= 800000:  return "DYield? (~708 kWh em Wh)"
-        if 70000 <= f <= 80000:    return "Pac? (~73 kW em W)"
-        if 500000 <= f <= 600000:  return "TYield? (~572 MWh em kWh)"
-        if 40 <= f <= 60:          return "temp? ou Iac?"
-        if 5 <= f <= 8:            return "corrente MPPT? (~6 A)"
-        return ""
-
     linhas = [
-        "--- TABELA DE CAMPOS DA CHINT ---",
-        f"--- total de {len(row)} campos ---",
+        f"--- ZOOM nos campos 105-124 (faixa truncada no log anterior) ---",
+        f"--- total de campos na row: {len(row)} ---",
+        f"--- valores esperados: Tmod=50,5 / Tamb=43,8 / ISO=434 ---",
         "",
         "  idx | valor                              | hint",
         "  ----+------------------------------------+--------------------------------",
     ]
-    for k in range(len(row)):
+    for k in range(105, min(len(row), 125)):
         v = row[k]
         repr_v = repr(v)
         if len(repr_v) > 34:
             repr_v = repr_v[:31] + "..."
-        linhas.append(f"  {k:3d} | {repr_v:<34} | {hint(v)}")
-    # tudo num unico print para evitar embaralhamento de logs
+        marca = ""
+        try:
+            f = float(v)
+            if 430 <= f <= 440:  marca = " <<<< ISO=434 ?"
+            elif 49 <= f <= 52:  marca = " <<<< Tmod=50,5 ?"
+            elif 42 <= f <= 46:  marca = " <<<< Tamb=43,8 ?"
+        except (ValueError, TypeError):
+            pass
+        linhas.append(f"  {k:3d} | {repr_v:<34} |{marca}")
     print("\n".join(linhas))
     print()
 
