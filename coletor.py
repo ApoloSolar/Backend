@@ -422,17 +422,16 @@ def main():
         print("AVISO: lista vazia. Sem dados para inspecionar.")
         sys.exit(0)
 
-    # Loga as primeiras 5 posicoes de cada uma das (ate) 3 primeiras rows
-    for i, row in enumerate(rows[:3]):
-        print(f"--- Leitura #{i+1} (total {len(row)} campos) ---")
-        for k in range(min(8, len(row))):
-            valor = row[k]
-            # Marca com asterisco se parece com uma data
-            marca = ""
-            if isinstance(valor, str) and len(valor) >= 16 and valor[4] == '-':
-                marca = "  <-- parece data"
-            print(f"  [{k}] {valor!r}{marca}")
-        print()
+    # Loga TODOS os campos da leitura mais recente
+    row = rows[0]
+    print(f"--- Leitura mais recente (total {len(row)} campos) ---")
+    for k in range(len(row)):
+        valor = row[k]
+        marca = ""
+        if isinstance(valor, str) and len(valor) >= 16 and len(valor) > 4 and valor[4:5] == '-':
+            marca = "  <-- parece data"
+        print(f"  [{k:3d}] {valor!r}{marca}")
+    print()
 
 
 if __name__ == "__main__":
