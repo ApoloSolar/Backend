@@ -117,12 +117,22 @@ def truncar_slot_5min(dt):
 
 
 def parse_data_chint(texto):
-    """Converte 'AAAA-MM-DD HH:MM:SS' em datetime. None se falhar."""
+    """Converte texto de data em datetime. None se falhar.
+    Aceita os formatos que a Chint usa atualmente:
+      'AAAA-MM-DD HH:MM:SS -0300'  (com offset, ex: '2026-05-27 14:15:16 -0300')
+      'AAAA-MM-DD HH:MM:SS'         (sem offset)
+      'AAAA-MM-DD HH:MM'            (sem segundos)
+    Quando ha offset, ele e removido e a data e tratada como sendo no fuso
+    do Brasil (que e o que pedimos a Chint via header time-zone)."""
     if not texto:
         return None
+    s = str(texto).strip()
+    # Remove offset tipo " -0300" ou " +0000" no final, caso exista
+    if len(s) >= 6 and s[-5] in ("+", "-") and s[-6] == " ":
+        s = s[:-6]
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(texto, fmt)
+            return datetime.strptime(s, fmt)
         except (ValueError, TypeError):
             continue
     return None
@@ -363,93 +373,99 @@ def gravar_leitura(cur, inversor_id, ts, status, campos, mppts, strings):
 # ============================================================
 
 def main():
-    """COLETOR DE DEBUG — nao grava no banco.
-    Pega um inversor da usina, busca na Chint, loga as 5 primeiras
-    posicoes da row para descobrir em qual delas esta a data.
-    """
+    # 'agora' no fuso do Brasil — o Railway roda em UTC.
+    # Isso corrige o bug latente da janela 21h-00h, em que datetime.now()
+    # do servidor virava o dia antes do Brasil.
+    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
+    alvo = slot_alvo(agora_br)
+
     print("=" * 60)
-    print("COLETOR DEBUG — descobrindo o indice da Date")
-    print("=" * 60)
+    print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} "
+          f"(BR) | slot alvo {alvo:%H:%M}")
 
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15)
     try:
         cur = conn.cursor()
+
+        # Carrega as topologias de todos os modelos cadastrados
+        topologias = carregar_topologias(cur)
+        if not topologias:
+            print("ERRO: nenhum modelo de inversor cadastrado.")
+            print("Rode o schema_v2.sql no banco primeiro.")
+            sys.exit(1)
+
+        # Busca os inversores desta usina, com o modelo de cada um
         cur.execute(
-            "SELECT i.nome, i.asset_id FROM inversor i "
-            "JOIN usina u ON u.id = i.usina_id "
-            "WHERE u.slug = %s ORDER BY i.idx LIMIT 1",
+            """
+            SELECT i.id, i.nome, i.asset_id, i.modelo_id
+            FROM inversor i
+            JOIN usina u ON u.id = i.usina_id
+            WHERE u.slug = %s
+            ORDER BY i.idx
+            """,
             (USINA_SLUG,),
         )
-        r = cur.fetchone()
-        if r is None:
-            print("ERRO: nenhum inversor cadastrado.")
+        inversores = cur.fetchall()
+
+        if not inversores:
+            print(f"ERRO: nenhum inversor para a usina '{USINA_SLUG}'.")
+            print("Rode o schema_v2.sql no banco primeiro.")
             sys.exit(1)
-        nome, asset_id = r
+
+        total_pac = 0.0
+        n_online  = 0
+        n_pulado  = 0
+        n_erro    = 0
+
+        for inv_id, nome, asset_id, modelo_id in inversores:
+            topo = topologias.get(modelo_id)
+            if topo is None:
+                print(f"  [{nome}] ERRO: modelo {modelo_id} sem topologia.")
+                n_erro += 1
+                continue
+
+            try:
+                row, ts_chint = buscar_inversor(asset_id, alvo)
+            except Exception as e:
+                print(f"  [{nome}] ERRO de API: {e}")
+                n_erro += 1
+                continue
+
+            if row is None:
+                # A Chint ainda nao publicou a leitura deste slot. Nao gravamos
+                # nada — o proximo ciclo do cron pega esse slot, sem poluir o
+                # banco com SEM_DADOS.
+                print(f"  [{nome}] aguardando slot {alvo:%H:%M} (Chint ainda nao publicou)")
+                n_pulado += 1
+                continue
+
+            # Grava usando o timestamp da Chint truncado para o slot (segundos=0).
+            # O UNIQUE(inversor_id, data_hora) garante que nao haja duplicacao.
+            ts_grava = truncar_slot_5min(ts_chint)
+
+            status, campos, mppts, strings = extrair_dados(row, topo)
+            gravar_leitura(cur, inv_id, ts_grava, status,
+                           campos, mppts, strings)
+            total_pac += campos["pac_kw"]
+            if status == "ONLINE":
+                n_online += 1
+            print(f"  [{nome}] {status} | {ts_chint:%H:%M:%S} -> {ts_grava:%H:%M} | "
+                  f"Pac: {campos['pac_kw']:.2f} kW")
+
+        # Confirma TODAS as gravacoes do ciclo de uma vez
+        conn.commit()
+        print("-" * 60)
+        print(f"  Potencia total: {total_pac:.2f} kW | "
+              f"Online: {n_online}/{len(inversores)} | "
+              f"Aguardando: {n_pulado} | Erros: {n_erro}")
+        print("  Ciclo concluido.")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"ERRO no ciclo — nada foi gravado: {e}")
+        sys.exit(1)
     finally:
         conn.close()
-
-    # Chama a Chint usando o dia de hoje no fuso BR
-    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
-    dia = agora_br.strftime("%Y-%m-%d")
-    print(f"Inversor escolhido: {nome}")
-    print(f"asset_id:           {asset_id}")
-    print(f"Buscando dia:       {dia}")
-    print(f"Agora (BR):         {agora_br:%Y-%m-%d %H:%M:%S}")
-    print()
-
-    url = (
-        f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
-        f"?assetId={asset_id}&startDay={dia}&endDay={dia}"
-        f"&dataType=&lang=pt-PT&page=1&limit=5"
-    )
-    try:
-        req = Request(url, headers=HEADERS)
-        resp = urlopen(req, timeout=20)
-        data = json.loads(resp.read())
-    except Exception as e:
-        print(f"ERRO chamando a Chint: {e}")
-        sys.exit(1)
-
-    if data.get("code") != "0":
-        print(f"Chint retornou erro: code={data.get('code')} msg={data.get('msg')}")
-        sys.exit(1)
-
-    rows = data.get("data", {}).get("dataList") or []
-    print(f"Chint devolveu {len(rows)} leitura(s).")
-    print()
-
-    if not rows:
-        print("AVISO: lista vazia. Sem dados para inspecionar.")
-        sys.exit(0)
-
-    # Loga APENAS os campos 105-124 (a faixa que foi truncada nos logs
-    # anteriores). E onde devem estar Tmod, Tamb e ISO conforme valores
-    # ja conhecidos da Chint: Tmod=50,5°C, Tamb=43,8°C, ISO=434 kOhm.
-    row = rows[0]
-    linhas = [
-        f"--- ZOOM nos campos 105-124 (faixa truncada no log anterior) ---",
-        f"--- total de campos na row: {len(row)} ---",
-        f"--- valores esperados: Tmod=50,5 / Tamb=43,8 / ISO=434 ---",
-        "",
-        "  idx | valor                              | hint",
-        "  ----+------------------------------------+--------------------------------",
-    ]
-    for k in range(105, min(len(row), 125)):
-        v = row[k]
-        repr_v = repr(v)
-        if len(repr_v) > 34:
-            repr_v = repr_v[:31] + "..."
-        marca = ""
-        try:
-            f = float(v)
-            if 430 <= f <= 440:  marca = " <<<< ISO=434 ?"
-            elif 49 <= f <= 52:  marca = " <<<< Tmod=50,5 ?"
-            elif 42 <= f <= 46:  marca = " <<<< Tamb=43,8 ?"
-        except (ValueError, TypeError):
-            pass
-        linhas.append(f"  {k:3d} | {repr_v:<34} |{marca}")
-    print("\n".join(linhas))
-    print()
 
 
 if __name__ == "__main__":
