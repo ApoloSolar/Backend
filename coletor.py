@@ -49,7 +49,10 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 TOKEN        = os.environ.get("CHINT_TOKEN")
 USER_ID      = os.environ.get("CHINT_USER_ID")
 
-if not DATABASE_URL or not TOKEN or not USER_ID:
+# Só aborta por variaveis faltando quando rodado como script principal.
+# Assim, outros scripts (ex: recuperar_hoje.py) podem importar este modulo
+# para reusar as funcoes sem disparar o exit no momento do import.
+if __name__ == "__main__" and (not DATABASE_URL or not TOKEN or not USER_ID):
     print("ERRO: variaveis de ambiente faltando.")
     print("  Configure no Railway: DATABASE_URL, CHINT_TOKEN, CHINT_USER_ID")
     sys.exit(1)
