@@ -103,13 +103,6 @@ def safe_float(val):
         return 0.0
 
 
-def slot_alvo(agora_br):
-    """Dado o 'agora' no fuso BR, retorna o slot multiplo de 5 anterior.
-    Ex.: 13:47:23 -> 13:45:00. Segundos e microssegundos zerados."""
-    minuto = (agora_br.minute // 5) * 5
-    return agora_br.replace(minute=minuto, second=0, microsecond=0)
-
-
 def truncar_slot_5min(dt):
     """Trunca um datetime para o multiplo de 5 min anterior, segundos = 0.
     Usado para alinhar o carimbo da Chint (ex: 13:45:16) ao slot (13:45:00)."""
@@ -162,23 +155,27 @@ def parse_data_chint(texto):
     return dt_local - timedelta(hours=offset_hh, minutes=offset_mm)
 
 
-def buscar_inversor(asset_id, alvo_br):
-    """Busca na API da Chint a leitura cujo carimbo, truncado para 5 min,
-    coincide com 'alvo_br' (slot que queremos preencher).
+def buscar_inversor(asset_id):
+    """Busca na API da Chint a leitura mais recente cujo minuto seja
+    multiplo exato de 5 (ignorando leituras 'fora-de-grid').
 
-    Retorna (row, ts_chint) ou (None, None) se nao houver leitura para o
-    slot. 'ts_chint' e o datetime original devolvido pela Chint (segundos
-    incluidos); o slot truncado e calculado novamente em main().
+    Retorna (row, ts_chint) ou (None, None) se nao houver nenhuma leitura
+    valida. 'ts_chint' e o datetime ja convertido para UTC.
 
-    Estrategia: pede as ultimas 10 leituras do dia (limit=10) e varre.
-    A Chint pode publicar a leitura de 13:45 com alguns segundos de atraso,
-    entao se o cron rodou as 13:47 e ela ainda nao publicou, a leitura
-    nao estara na lista e devolvemos None — o proximo ciclo pega."""
-    dia = alvo_br.strftime("%Y-%m-%d")
+    Exemplo (OPCAO A): se o cron roda 08:59 e a Chint tem
+    09:05? nao (futuro), 08:57:36 (fora-de-grid, ignora),
+    08:55:16 (multiplo de 5) -> pega esta.
+
+    A Chint devolve as leituras em ordem decrescente (mais recente
+    primeiro), entao a primeira que passa no filtro de minuto e a
+    mais recente valida.
+
+    Pede limit=15 para ter margem (algumas podem ser fora-de-grid)."""
+    hoje_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d")
     url = (
         f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
-        f"?assetId={asset_id}&startDay={dia}&endDay={dia}"
-        f"&dataType=&lang=pt-PT&page=1&limit=10"
+        f"?assetId={asset_id}&startDay={hoje_br}&endDay={hoje_br}"
+        f"&dataType=&lang=pt-PT&page=1&limit=15"
     )
     req  = Request(url, headers=HEADERS)
     resp = urlopen(req, timeout=20)
@@ -187,9 +184,6 @@ def buscar_inversor(asset_id, alvo_br):
         raise ValueError(f"API Chint retornou erro: {data.get('msg')}")
     rows = data.get("data", {}).get("dataList") or []
 
-    # Converte o alvo (BR) para UTC, ja que parse_data_chint retorna UTC
-    alvo_utc = (alvo_br + timedelta(hours=3)).replace(tzinfo=None)
-
     for row in rows:
         if not row:
             continue
@@ -197,17 +191,14 @@ def buscar_inversor(asset_id, alvo_br):
         if ts is None:
             continue
 
-        # A Chint as vezes publica leituras "fora-de-grid" (ex: 11:07:24).
-        # So aceitamos leituras cujo MINUTO seja multiplo exato de 5; as
-        # fora-de-grid sao ignoradas (o usuario confirmou que sao raras).
-        # Obs: o minuto e preservado pela conversao para UTC (offset e horas).
+        # Ignora leituras fora-de-grid: so aceita minuto multiplo de 5.
+        # (o minuto e preservado na conversao para UTC, pois o offset
+        #  e em horas inteiras)
         if ts.minute % 5 != 0:
             continue
 
-        # Compara o slot da leitura (em UTC) com o alvo (tambem em UTC).
-        slot_leitura = ts.replace(second=0, microsecond=0)
-        if slot_leitura == alvo_utc:
-            return row, ts
+        # Primeira valida = mais recente (a Chint devolve em ordem desc)
+        return row, ts
 
     return None, None
 
@@ -402,14 +393,11 @@ def gravar_leitura(cur, inversor_id, ts, status, campos, mppts, strings):
 
 def main():
     # 'agora' no fuso do Brasil — o Railway roda em UTC.
-    # Isso corrige o bug latente da janela 21h-00h, em que datetime.now()
-    # do servidor virava o dia antes do Brasil.
     agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
-    alvo = slot_alvo(agora_br)
 
     print("=" * 60)
-    print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} "
-          f"(BR) | slot alvo {alvo:%H:%M}")
+    print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
+    print("  (modo: pega a leitura mais recente multipla de 5 de cada inversor)")
 
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15)
     try:
@@ -453,17 +441,16 @@ def main():
                 continue
 
             try:
-                row, ts_chint = buscar_inversor(asset_id, alvo)
+                row, ts_chint = buscar_inversor(asset_id)
             except Exception as e:
                 print(f"  [{nome}] ERRO de API: {e}")
                 n_erro += 1
                 continue
 
             if row is None:
-                # A Chint ainda nao publicou a leitura deste slot. Nao gravamos
-                # nada — o proximo ciclo do cron pega esse slot, sem poluir o
-                # banco com SEM_DADOS.
-                print(f"  [{nome}] aguardando slot {alvo:%H:%M} (Chint ainda nao publicou)")
+                # Nenhuma leitura multipla de 5 disponivel para este inversor.
+                # Nao grava nada — o proximo ciclo tenta de novo.
+                print(f"  [{nome}] sem leitura valida (Chint sem multiplo de 5)")
                 n_pulado += 1
                 continue
 
