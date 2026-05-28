@@ -73,6 +73,11 @@ HEADERS = {
 # Slug da usina deste coletor (deve existir na tabela 'usina')
 USINA_SLUG = "pk"
 
+# Quantos slots de 5min para tras o backfill verifica/completa a cada ciclo.
+# 3 slots = 15 minutos. Cobre o caso de a Chint propagar um inversor com
+# atraso de 1-2 slots, sem pesar.
+BACKFILL_SLOTS = 3
+
 # Fuso do Brasil (a Chint publica no fuso de Sao Paulo conforme o header
 # 'time-zone' que enviamos; o Railway roda em UTC, entao precisamos converter)
 FUSO_BR = timezone(timedelta(hours=-3))
@@ -158,22 +163,15 @@ def parse_data_chint(texto):
     return dt_local - timedelta(hours=offset_hh, minutes=offset_mm)
 
 
-def buscar_inversor(asset_id):
-    """Busca na API da Chint a leitura mais recente cujo minuto seja
-    multiplo exato de 5 (ignorando leituras 'fora-de-grid').
+def buscar_leituras_validas(asset_id):
+    """Busca na Chint as ultimas leituras e retorna TODAS as que sao
+    multiplas de 5 (ignorando as 'fora-de-grid'), ja convertidas para UTC.
 
-    Retorna (row, ts_chint) ou (None, None) se nao houver nenhuma leitura
-    valida. 'ts_chint' e o datetime ja convertido para UTC.
+    Retorna uma lista de tuplas (ts_utc, row), ordenada da mais recente
+    para a mais antiga (a Chint ja devolve assim).
 
-    Exemplo (OPCAO A): se o cron roda 08:59 e a Chint tem
-    09:05? nao (futuro), 08:57:36 (fora-de-grid, ignora),
-    08:55:16 (multiplo de 5) -> pega esta.
-
-    A Chint devolve as leituras em ordem decrescente (mais recente
-    primeiro), entao a primeira que passa no filtro de minuto e a
-    mais recente valida.
-
-    Pede limit=15 para ter margem (algumas podem ser fora-de-grid)."""
+    Pede limit=15 para ter margem: cobre o slot atual + varios slots
+    anteriores (para o backfill) + eventuais fora-de-grid descartadas."""
     hoje_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d")
     url = (
         f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
@@ -187,23 +185,18 @@ def buscar_inversor(asset_id):
         raise ValueError(f"API Chint retornou erro: {data.get('msg')}")
     rows = data.get("data", {}).get("dataList") or []
 
+    validas = []
     for row in rows:
         if not row:
             continue
         ts = parse_data_chint(row[IDX_DATE]) if IDX_DATE < len(row) else None
         if ts is None:
             continue
-
-        # Ignora leituras fora-de-grid: so aceita minuto multiplo de 5.
-        # (o minuto e preservado na conversao para UTC, pois o offset
-        #  e em horas inteiras)
+        # Ignora fora-de-grid: so minuto multiplo de 5
         if ts.minute % 5 != 0:
             continue
-
-        # Primeira valida = mais recente (a Chint devolve em ordem desc)
-        return row, ts
-
-    return None, None
+        validas.append((ts, row))
+    return validas
 
 
 def extrair_dados(row, topologia):
@@ -435,6 +428,7 @@ def main():
         n_online  = 0
         n_pulado  = 0
         n_erro    = 0
+        n_backfill = 0
 
         for inv_id, nome, asset_id, modelo_id in inversores:
             topo = topologias.get(modelo_id)
@@ -444,42 +438,79 @@ def main():
                 continue
 
             try:
-                row, ts_chint = buscar_inversor(asset_id)
+                validas = buscar_leituras_validas(asset_id)
             except Exception as e:
                 print(f"  [{nome}] ERRO de API: {e}")
                 n_erro += 1
                 continue
 
-            if row is None:
-                # Nenhuma leitura multipla de 5 disponivel para este inversor.
-                # Nao grava nada — o proximo ciclo tenta de novo.
+            if not validas:
                 print(f"  [{nome}] sem leitura valida (Chint sem multiplo de 5)")
                 n_pulado += 1
                 continue
 
-            # Grava usando o timestamp da Chint truncado para o slot (segundos=0).
-            # ts_chint vem em UTC (do parse_data_chint), gravamos em UTC.
-            # O UNIQUE(inversor_id, data_hora) garante que nao haja duplicacao.
-            ts_grava = truncar_slot_5min(ts_chint)
+            # Monta o dicionario {slot_utc: row} das leituras retornadas,
+            # truncando segundos. Slots duplicados ficam com a 1a (mais recente).
+            por_slot = {}
+            for ts, row in validas:
+                slot = truncar_slot_5min(ts)
+                if slot not in por_slot:
+                    por_slot[slot] = (ts, row)
 
-            status, campos, mppts, strings = extrair_dados(row, topo)
-            gravar_leitura(cur, inv_id, ts_grava, status,
-                           campos, mppts, strings)
-            total_pac += campos["pac_kw"]
-            if status == "ONLINE":
-                n_online += 1
-            # Mostra horarios em BR no log (mais facil de conferir com a Chint)
-            ts_chint_br = ts_chint - timedelta(hours=3)
-            ts_grava_br = ts_grava - timedelta(hours=3)
-            print(f"  [{nome}] {status} | Chint {ts_chint_br:%H:%M:%S} BR -> "
-                  f"slot {ts_grava_br:%H:%M} BR | Pac: {campos['pac_kw']:.2f} kW")
+            # Slot atual (mais recente) + os BACKFILL_SLOTS anteriores.
+            # validas[0] e a leitura mais recente.
+            slot_atual = truncar_slot_5min(validas[0][0])
+            slots_alvo = [slot_atual - timedelta(minutes=5 * k)
+                          for k in range(BACKFILL_SLOTS + 1)]
+
+            # 1 query: quais desses slots ja existem no banco para este inversor
+            cur.execute(
+                """
+                SELECT data_hora FROM leitura
+                WHERE inversor_id = %s AND data_hora = ANY(%s)
+                """,
+                (inv_id, slots_alvo),
+            )
+            ja_existem = {r[0].replace(tzinfo=None) if r[0].tzinfo else r[0]
+                          for r in cur.fetchall()}
+
+            # Grava o slot atual e completa os anteriores que faltam
+            gravou_atual = False
+            for i, slot in enumerate(slots_alvo):
+                # so grava se a Chint tem esse slot na resposta
+                if slot not in por_slot:
+                    continue
+                # o slot atual sempre (re)grava; os anteriores so se faltam
+                if i > 0 and slot in ja_existem:
+                    continue
+
+                ts_orig, row = por_slot[slot]
+                status, campos, mppts, strings = extrair_dados(row, topo)
+                gravar_leitura(cur, inv_id, slot, status,
+                               campos, mppts, strings)
+
+                slot_br = slot - timedelta(hours=3)
+                if i == 0:
+                    gravou_atual = True
+                    total_pac += campos["pac_kw"]
+                    if status == "ONLINE":
+                        n_online += 1
+                    print(f"  [{nome}] {status} | slot {slot_br:%H:%M} BR | "
+                          f"Pac: {campos['pac_kw']:.2f} kW")
+                else:
+                    n_backfill += 1
+                    print(f"  [{nome}]   + backfill slot {slot_br:%H:%M} BR "
+                          f"(estava faltando)")
+
+            if not gravou_atual:
+                n_pulado += 1
 
         # Confirma TODAS as gravacoes do ciclo de uma vez
         conn.commit()
         print("-" * 60)
         print(f"  Potencia total: {total_pac:.2f} kW | "
               f"Online: {n_online}/{len(inversores)} | "
-              f"Aguardando: {n_pulado} | Erros: {n_erro}")
+              f"Backfill: {n_backfill} | Sem dado: {n_pulado} | Erros: {n_erro}")
         print("  Ciclo concluido.")
 
     except Exception as e:
