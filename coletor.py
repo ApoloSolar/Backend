@@ -37,6 +37,7 @@ import json
 import os
 import re
 import sys
+import time
 
 import psycopg
 
@@ -73,10 +74,12 @@ HEADERS = {
 # Slug da usina deste coletor (deve existir na tabela 'usina')
 USINA_SLUG = "pk"
 
-# Quantos slots de 5min para tras o backfill verifica/completa a cada ciclo.
-# 3 slots = 15 minutos. Cobre o caso de a Chint propagar um inversor com
-# atraso de 1-2 slots, sem pesar.
-BACKFILL_SLOTS = 3
+# Espera no inicio de cada execucao, em segundos, antes de consultar a Chint.
+# O cron dispara em horarios multiplos de 5 (XX:00, XX:05, ...), mas a Chint
+# leva alguns segundos para propagar a leitura do slot atual entre todos os
+# inversores. Esperar antes de consultar evita pegar o slot anterior por
+# corrida de timing.
+DELAY_SEGUNDOS = 20
 
 # Fuso do Brasil (a Chint publica no fuso de Sao Paulo conforme o header
 # 'time-zone' que enviamos; o Railway roda em UTC, entao precisamos converter)
@@ -170,8 +173,8 @@ def buscar_leituras_validas(asset_id):
     Retorna uma lista de tuplas (ts_utc, row), ordenada da mais recente
     para a mais antiga (a Chint ja devolve assim).
 
-    Pede limit=15 para ter margem: cobre o slot atual + varios slots
-    anteriores (para o backfill) + eventuais fora-de-grid descartadas."""
+    Pede limit=15 para ter margem caso varias leituras sejam fora-de-grid
+    e precisem ser descartadas (sobra ainda a mais recente valida)."""
     hoje_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d")
     url = (
         f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
@@ -393,7 +396,17 @@ def main():
 
     print("=" * 60)
     print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
-    print("  (modo: pega a leitura mais recente multipla de 5 de cada inversor)")
+    print(f"  Aguardando {DELAY_SEGUNDOS}s para a Chint propagar o slot...")
+
+    # Espera antes de consultar a Chint, para que o slot atual ja tenha
+    # propagado para todos os inversores. O cron dispara no minuto exato
+    # (XX:00, XX:05, ...), mas a Chint demora alguns segundos para
+    # disponibilizar a leitura mais recente em todos os inversores.
+    time.sleep(DELAY_SEGUNDOS)
+
+    # Re-le 'agora' apos o sleep, para o log de pos-espera
+    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
+    print(f"  Iniciando coleta as {agora_br:%H:%M:%S} (BR)")
 
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15)
     try:
@@ -428,7 +441,6 @@ def main():
         n_online  = 0
         n_pulado  = 0
         n_erro    = 0
-        n_backfill = 0
 
         for inv_id, nome, asset_id, modelo_id in inversores:
             topo = topologias.get(modelo_id)
@@ -449,68 +461,29 @@ def main():
                 n_pulado += 1
                 continue
 
-            # Monta o dicionario {slot_utc: row} das leituras retornadas,
-            # truncando segundos. Slots duplicados ficam com a 1a (mais recente).
-            por_slot = {}
-            for ts, row in validas:
-                slot = truncar_slot_5min(ts)
-                if slot not in por_slot:
-                    por_slot[slot] = (ts, row)
+            # Opcao A: pega a leitura mais recente multipla de 5
+            # (validas[0] e a mais recente; ja filtradas pelo fora-de-grid)
+            ts_chint, row = validas[0]
+            ts_grava = truncar_slot_5min(ts_chint)
 
-            # Slot atual (mais recente) + os BACKFILL_SLOTS anteriores.
-            # validas[0] e a leitura mais recente.
-            slot_atual = truncar_slot_5min(validas[0][0])
-            slots_alvo = [slot_atual - timedelta(minutes=5 * k)
-                          for k in range(BACKFILL_SLOTS + 1)]
+            status, campos, mppts, strings = extrair_dados(row, topo)
+            gravar_leitura(cur, inv_id, ts_grava, status,
+                           campos, mppts, strings)
+            total_pac += campos["pac_kw"]
+            if status == "ONLINE":
+                n_online += 1
 
-            # 1 query: quais desses slots ja existem no banco para este inversor
-            cur.execute(
-                """
-                SELECT data_hora FROM leitura
-                WHERE inversor_id = %s AND data_hora = ANY(%s)
-                """,
-                (inv_id, slots_alvo),
-            )
-            ja_existem = {r[0].replace(tzinfo=None) if r[0].tzinfo else r[0]
-                          for r in cur.fetchall()}
-
-            # Grava o slot atual e completa os anteriores que faltam
-            gravou_atual = False
-            for i, slot in enumerate(slots_alvo):
-                # so grava se a Chint tem esse slot na resposta
-                if slot not in por_slot:
-                    continue
-                # o slot atual sempre (re)grava; os anteriores so se faltam
-                if i > 0 and slot in ja_existem:
-                    continue
-
-                ts_orig, row = por_slot[slot]
-                status, campos, mppts, strings = extrair_dados(row, topo)
-                gravar_leitura(cur, inv_id, slot, status,
-                               campos, mppts, strings)
-
-                slot_br = slot - timedelta(hours=3)
-                if i == 0:
-                    gravou_atual = True
-                    total_pac += campos["pac_kw"]
-                    if status == "ONLINE":
-                        n_online += 1
-                    print(f"  [{nome}] {status} | slot {slot_br:%H:%M} BR | "
-                          f"Pac: {campos['pac_kw']:.2f} kW")
-                else:
-                    n_backfill += 1
-                    print(f"  [{nome}]   + backfill slot {slot_br:%H:%M} BR "
-                          f"(estava faltando)")
-
-            if not gravou_atual:
-                n_pulado += 1
+            ts_chint_br = ts_chint - timedelta(hours=3)
+            ts_grava_br = ts_grava - timedelta(hours=3)
+            print(f"  [{nome}] {status} | Chint {ts_chint_br:%H:%M:%S} BR -> "
+                  f"slot {ts_grava_br:%H:%M} BR | Pac: {campos['pac_kw']:.2f} kW")
 
         # Confirma TODAS as gravacoes do ciclo de uma vez
         conn.commit()
         print("-" * 60)
         print(f"  Potencia total: {total_pac:.2f} kW | "
               f"Online: {n_online}/{len(inversores)} | "
-              f"Backfill: {n_backfill} | Sem dado: {n_pulado} | Erros: {n_erro}")
+              f"Sem dado: {n_pulado} | Erros: {n_erro}")
         print("  Ciclo concluido.")
 
     except Exception as e:
