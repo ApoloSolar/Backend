@@ -21,6 +21,21 @@ NOVIDADES DA v2 (schema v2):
 COMO RODA:
   - Roda UMA vez e encerra. O Railway repete a cada 5 min
     via cron job.
+  - O cron deve disparar 1 minuto APOS a postagem da Chint
+    (ex: cron em XX:01/XX:06/...; cronSchedule "1-59/5 * * * *"),
+    porque a Chint posta o slot em XX:00:16 e leva alguns
+    segundos para propagar a leitura entre TODOS os inversores.
+    Disparar em XX:01 garante que o slot recem-postado ja
+    esteja disponivel em todos eles.
+
+SLOT ALVO (correcao da coleta incompleta):
+  - Em vez de cada inversor gravar "a sua leitura mais recente"
+    (o que, numa corrida de propagacao, fazia uns gravarem o
+    slot novo e outros o anterior — deixando buracos no slot
+    atual), o ciclo calcula UM slot alvo unico e TODOS os
+    inversores miram esse mesmo slot. Quem ainda nao tiver o
+    slot e pulado e logado, em vez de regravar silenciosamente
+    o slot anterior.
 
 CREDENCIAIS — lidas de variaveis de ambiente no Railway:
   DATABASE_URL   -> string de conexao do PostgreSQL
@@ -37,7 +52,6 @@ import json
 import os
 import re
 import sys
-import time
 
 import psycopg
 
@@ -73,13 +87,6 @@ HEADERS = {
 
 # Slug da usina deste coletor (deve existir na tabela 'usina')
 USINA_SLUG = "pk"
-
-# Espera no inicio de cada execucao, em segundos, antes de consultar a Chint.
-# O cron dispara em horarios multiplos de 5 (XX:00, XX:05, ...), mas a Chint
-# leva alguns segundos para propagar a leitura do slot atual entre todos os
-# inversores. Esperar antes de consultar evita pegar o slot anterior por
-# corrida de timing.
-DELAY_SEGUNDOS = 20
 
 # Fuso do Brasil (a Chint publica no fuso de Sao Paulo conforme o header
 # 'time-zone' que enviamos; o Railway roda em UTC, entao precisamos converter)
@@ -396,17 +403,16 @@ def main():
 
     print("=" * 60)
     print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
-    print(f"  Aguardando {DELAY_SEGUNDOS}s para a Chint propagar o slot...")
 
-    # Espera antes de consultar a Chint, para que o slot atual ja tenha
-    # propagado para todos os inversores. O cron dispara no minuto exato
-    # (XX:00, XX:05, ...), mas a Chint demora alguns segundos para
-    # disponibilizar a leitura mais recente em todos os inversores.
-    time.sleep(DELAY_SEGUNDOS)
-
-    # Re-le 'agora' apos o sleep, para o log de pos-espera
-    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
-    print(f"  Iniciando coleta as {agora_br:%H:%M:%S} (BR)")
+    # Slot alvo deste ciclo: o ultimo multiplo de 5 que ja deve estar publicado.
+    # Com o cron disparando 1 min apos a postagem da Chint (XX:01), truncar
+    # 'agora' para o multiplo de 5 anterior aponta exatamente para o slot
+    # recem-postado (XX:00). TODOS os inversores deste ciclo miram este mesmo
+    # slot — assim eliminamos a corrida em que um inversor ja propagou o slot
+    # novo e outro ainda nao, que antes deixava buracos no slot atual.
+    agora_utc = agora_br + timedelta(hours=3)   # BR (-3) -> UTC (convencao do banco)
+    slot_alvo = truncar_slot_5min(agora_utc)
+    print(f"  Slot alvo deste ciclo: {slot_alvo - timedelta(hours=3):%H:%M} BR")
 
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15)
     try:
@@ -461,10 +467,24 @@ def main():
                 n_pulado += 1
                 continue
 
-            # Opcao A: pega a leitura mais recente multipla de 5
-            # (validas[0] e a mais recente; ja filtradas pelo fora-de-grid)
-            ts_chint, row = validas[0]
-            ts_grava = truncar_slot_5min(ts_chint)
+            # Procura a leitura do SLOT ALVO (o mesmo para todos os inversores
+            # deste ciclo). Garante que todos gravem no mesmo timestamp e evita
+            # que, numa corrida de propagacao, uns gravem o slot novo e outros o
+            # anterior. Quem ainda nao tiver o slot e pulado e logado, em vez de
+            # regravar silenciosamente o slot anterior.
+            match = next(
+                ((ts, r) for ts, r in validas
+                 if truncar_slot_5min(ts) == slot_alvo),
+                None,
+            )
+            if match is None:
+                ts_br = slot_alvo - timedelta(hours=3)
+                print(f"  [{nome}] slot {ts_br:%H:%M} BR ainda nao publicado — pulando")
+                n_pulado += 1
+                continue
+
+            ts_chint, row = match
+            ts_grava = slot_alvo
 
             status, campos, mppts, strings = extrair_dados(row, topo)
             gravar_leitura(cur, inv_id, ts_grava, status,
