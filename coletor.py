@@ -37,6 +37,18 @@ SLOT ALVO (correcao da coleta incompleta):
     slot e pulado e logado, em vez de regravar silenciosamente
     o slot anterior.
 
+SNAPSHOT PARCIAL (correcao de leitura ~0 espuria):
+  - As vezes a Chint publica o slot alvo para um inversor, mas
+    com o Pac ainda zerado (snapshot parcial / nao consolidado),
+    mesmo com o inversor em 'Running'. Gravar isso geraria um
+    falso ~0 (o inversor aparece "zerado" no dashboard enquanto
+    na verdade esta gerando ~230 kW). O ciclo agora detecta
+    'Running + Pac~0', trata como NAO consolidado e pula o
+    inversor naquele ciclo, preservando a ultima leitura boa.
+    Um inversor realmente parado (Waiting/Standby/Fault/Off, ou
+    de noite) tem Mode != Running e passa normal, gravando o
+    zero legitimo.
+
 CREDENCIAIS — lidas de variaveis de ambiente no Railway:
   DATABASE_URL   -> string de conexao do PostgreSQL
   CHINT_TOKEN    -> token de acesso a API da Chint
@@ -98,6 +110,7 @@ IDX_TYIELD = 4
 IDX_DYIELD = 5
 IDX_PAC    = 10
 IDX_FREQ   = 18
+IDX_MODE   = 28          # 'Mode' -> 'Running', 'Waiting', 'Fault', 'Off', ...
 IDX_UMPPT1 = 40
 IDX_IMPPT1 = 41
 IDX_IPV1   = 64
@@ -105,6 +118,13 @@ IDX_PDC    = 92
 IDX_TMOD   = 115
 IDX_TAMB   = 116
 IDX_ISO    = 117
+
+# Pac minimo (kW) para uma leitura "Running" ser considerada consolidada.
+# Abaixo disso, com o inversor em Running, a row e tratada como snapshot
+# PARCIAL da Chint (slot publicado mas Pac ainda nao consolidado) e descartada,
+# para nao gravar um zero falso. Ajuste se a frota usar outro valor de 'Mode'
+# para "gerando", ou se houver leituras legitimas sustentadas abaixo de 1 kW.
+PAC_MIN_RUNNING_KW = 1.0
 
 
 # ============================================================
@@ -119,6 +139,18 @@ def safe_float(val):
         return float(val)
     except (ValueError, TypeError):
         return 0.0
+
+
+def leitura_parcial(row):
+    """True se a row parece um snapshot PARCIAL da Chint: o inversor diz
+    estar 'Running' mas o Pac veio ~0 (slot publicado, ainda nao consolidado).
+
+    So 'Running + Pac~0' e tratado como suspeito. Um inversor realmente
+    parado (Waiting/Standby/Fault/Off, ou de noite) tem Mode != Running e
+    passa normalmente, gravando o zero legitimo."""
+    modo = str(row[IDX_MODE] or "").strip().lower() if IDX_MODE < len(row) else ""
+    pac_kw = safe_float(row[IDX_PAC]) / 1000.0
+    return modo == "running" and pac_kw < PAC_MIN_RUNNING_KW
 
 
 def truncar_slot_5min(dt):
@@ -484,6 +516,18 @@ def main():
                 continue
 
             ts_chint, row = match
+
+            # Se o slot foi publicado mas veio como snapshot PARCIAL
+            # (Running com Pac ~0), trata como "ainda nao consolidado":
+            # pula e loga, em vez de gravar um zero falso. O dashboard
+            # mantem a ultima leitura boa do inversor ate o slot consolidar.
+            if leitura_parcial(row):
+                ts_br = slot_alvo - timedelta(hours=3)
+                print(f"  [{nome}] slot {ts_br:%H:%M} BR parcial "
+                      f"(Running/Pac~0) — pulando ate consolidar")
+                n_pulado += 1
+                continue
+
             ts_grava = slot_alvo
 
             status, campos, mppts, strings = extrair_dados(row, topo)
