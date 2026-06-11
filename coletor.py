@@ -1,22 +1,30 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  COLETOR v2 — APOLO SOLAR  (Railway / PostgreSQL)
+  COLETOR v3 — APOLO SOLAR  (Railway / PostgreSQL)
 ============================================================
 Le os inversores de uma usina na API da Chint e grava as
 leituras no banco PostgreSQL (schema v2).
 
-Coleta por TITULO, nao por posicao:
-  - Cada coluna da resposta da Chint e localizada pelo seu
-    TITULO no cabecalho que a API devolve. Se a Chint
-    reordenar/inserir colunas, o coletor continua pegando o
-    dado certo.
-  - A coluna do carimbo de hora e detectada PELO VALOR: e a
-    coluna cujos valores realmente parseiam como data e que
-    variam entre as leituras (o carimbo real muda a cada 5
-    min; colunas-isca de hora fixa sao descartadas).
-  - Os IDX_* antigos viraram apenas FALLBACK: so sao usados
-    quando a resposta nao trouxer cabecalho / titulo do campo.
+O QUE MUDOU DA v2 PARA A v3 (e POR QUE):
+  - A v2 resolvia cada coluna pelo TITULO do cabecalho. Esse
+    casamento usava substring (kw in titulo), com palavras-
+    chave curtissimas — inclusive a letra solta "e" para
+    'etotal'/'etoday'. "e" e substring de quase qualquer
+    titulo (esta dentro de "power", "current", etc.), entao
+    os campos casavam com a coluna ERRADA. Pior: o primeiro
+    indice que casava ficava TRAVADO (set 'usados'), e a
+    coluna certa nao podia mais ser reivindicada. Resultado:
+    dados gravados trocados, mesmo com a Chint mantendo as
+    colunas fixas. O problema NUNCA foi a Chint reordenar —
+    foi o matcher por titulo escolhendo errado em silencio.
+  - A v3 volta ao esquema da v1: cada dado e lido pelo seu
+    INDICE FIXO na resposta da Chint (IDX_*). Sem casamento
+    por titulo, sem deteccao por valor. Determinístico.
+  - Opcional: DIAGNOSTICO_TITULOS imprime, uma vez, o titulo
+    que esta em cada indice fixo. Serve so para conferir/
+    ajustar os IDX_* caso a Chint mude o layout no futuro.
+    NAO altera a leitura — e puramente informativo.
 
 COMO RODA:
   - Roda UMA vez e encerra. O Railway repete a cada 5 min
@@ -38,7 +46,6 @@ import os
 import re
 import sys
 import time
-import unicodedata
 
 import psycopg
 
@@ -52,6 +59,8 @@ TOKEN        = os.environ.get("CHINT_TOKEN")
 USER_ID      = os.environ.get("CHINT_USER_ID")
 
 # Só aborta por variaveis faltando quando rodado como script principal.
+# Assim, outros scripts (ex: recuperar_hoje.py) podem importar este modulo
+# para reusar as funcoes sem disparar o exit no momento do import.
 if __name__ == "__main__" and (not DATABASE_URL or not TOKEN or not USER_ID):
     print("ERRO: variaveis de ambiente faltando.")
     print("  Configure no Railway: DATABASE_URL, CHINT_TOKEN, CHINT_USER_ID")
@@ -74,78 +83,42 @@ HEADERS = {
 USINA_SLUG = "pk"
 
 # Espera no inicio de cada execucao, em segundos, antes de consultar a Chint.
+# O cron dispara em horarios multiplos de 5 (XX:00, XX:05, ...), mas a Chint
+# leva alguns segundos para propagar a leitura do slot atual entre todos os
+# inversores. Esperar antes de consultar evita pegar o slot anterior por
+# corrida de timing.
 DELAY_SEGUNDOS = 20
 
-# Fuso do Brasil (a Chint publica no fuso de Sao Paulo; o Railway roda em UTC)
+# Fuso do Brasil (a Chint publica no fuso de Sao Paulo conforme o header
+# 'time-zone'; o Railway roda em UTC, entao convertemos para gravar em UTC).
 FUSO_BR = timezone(timedelta(hours=-3))
 
+# Diagnostico opcional: se True, imprime UMA vez o titulo de cada indice fixo
+# (quando a resposta da Chint traz cabecalho). Util para conferir os IDX_*.
+# NAO interfere na leitura — os dados continuam vindo pelo indice fixo.
+DIAGNOSTICO_TITULOS = False
+
 
 # ============================================================
-# FALLBACK — indices fixos antigos da resposta da API Chint
+# INDICES FIXOS DOS CAMPOS NA RESPOSTA DA API CHINT
 # ------------------------------------------------------------
-# SO usados quando a resposta NAO traz cabecalho ou o titulo de
-# um campo nao casa. Com cabecalho, a resolucao por TITULO vence.
+# Cada dado e lido SEMPRE pela mesma posicao na 'row' que a
+# Chint devolve em data.dataList. Se algum dia a Chint mudar a
+# ordem das colunas, ajuste os numeros abaixo (ligue o
+# DIAGNOSTICO_TITULOS para ver qual titulo esta em cada indice).
 # ============================================================
-IDX_DATE   = 0
-IDX_TYIELD = 4
-IDX_DYIELD = 5
-IDX_PAC    = 10
-IDX_FREQ   = 18
-IDX_UMPPT1 = 40
-IDX_IMPPT1 = 41
-IDX_IPV1   = 64
-IDX_PDC    = 92
-IDX_TMOD   = 115
-IDX_TAMB   = 116
-IDX_ISO    = 117
-
-
-# ============================================================
-# MAPA DE TITULOS — palavras-chave para casar cada campo
-# ------------------------------------------------------------
-# Para cada campo, uma lista de "candidatos". Cada candidato e
-# uma lista de palavras-chave (ja normalizadas: minusculas, sem
-# acento, CamelCase quebrado) que TODAS precisam aparecer no
-# titulo da coluna. A ordem importa: o 1o candidato que casar
-# vence — coloque os mais especificos primeiro.
-# ============================================================
-MAPA_TITULOS = {
-    # 'data' aqui e so reforco; a deteccao principal e por VALOR.
-    "data": [
-        ["update", "time"], ["collect", "time"], ["data", "hora"],
-    ],
-    "tyield_kwh": [
-        ["etotal"], ["e", "total"], ["total", "yield"],
-        ["energia", "total"], ["geracao", "total"], ["lifetime"],
-    ],
-    "dyield_kwh": [
-        ["etoday"], ["eday"], ["e", "today"], ["e", "day"],
-        ["daily", "yield"], ["geracao", "diaria"], ["geracao", "dia"],
-        ["energia", "dia"], ["today"],
-    ],
-    "pac_kw": [
-        ["pac"], ["potencia", "ativa"], ["potencia", "saida"],
-        ["active", "power"],
-    ],
-    "freq_hz": [
-        ["freq"], ["frequencia"], ["frequency"],
-    ],
-    "pdc_kw": [
-        ["pdc"], ["potencia", "cc"], ["potencia", "dc"], ["dc", "power"],
-    ],
-    "tmod_c": [
-        ["tmod"], ["temp", "mod"], ["mod", "temp"],
-        ["temperatura", "modulo"], ["module", "temp"],
-    ],
-    "tamb_c": [
-        ["tamb"], ["temp", "amb"], ["temperatura", "ambiente"],
-        ["ambient", "temp"],
-    ],
-    "iso_kohm": [
-        ["iso"], ["resistencia", "isolamento"],
-        ["impedancia", "isolamento"], ["insulation"],
-    ],
-}
+IDX_DATE   = 0           # carimbo da Chint, ex: "2026-05-27 13:45:16"
+IDX_TYIELD = 4           # energia total (kWh)
+IDX_DYIELD = 5           # energia do dia (Wh -> /1000 = kWh)
+IDX_PAC    = 10          # potencia ativa (W -> /1000 = kW)
+IDX_FREQ   = 18          # frequencia (Hz)
+IDX_UMPPT1 = 40          # tensao do MPPT 1; demais: +2 por MPPT
+IDX_IMPPT1 = 41          # corrente do MPPT 1; demais: +2 por MPPT
+IDX_IPV1   = 64          # corrente da string PV 1; demais: +1 por string
+IDX_PDC    = 92          # potencia CC (kW)
+IDX_TMOD   = 115         # temperatura do modulo (C)
+IDX_TAMB   = 116         # temperatura ambiente (C)
+IDX_ISO    = 117         # resistencia de isolamento (kOhm)
 
 
 # ============================================================
@@ -162,34 +135,9 @@ def safe_float(val):
         return 0.0
 
 
-def _norm(texto):
-    """Normaliza um titulo para comparar: sem acento, CamelCase quebrado,
-    minusculas, sem caracteres especiais.
-
-    A quebra de CamelCase evita colisoes: sem ela, 'PVInputMode' vira
-    'pvinputmode' e a palavra-chave 'tmod' casaria dentro de 'inpuTMODe'.
-    Com ela, vira 'pv input mode' e nao casa mais."""
-    if texto is None:
-        return ""
-    s = str(texto)
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    # quebra CamelCase: minuscula/digito seguido de maiuscula, e
-    # maiuscula seguida de Maiuscula+minuscula
-    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
-    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return s.strip()
-
-
-def _casa_candidato(titulo_norm, candidato):
-    """True se TODAS as palavras-chave do candidato aparecem no titulo."""
-    return all(kw in titulo_norm for kw in candidato)
-
-
 def truncar_slot_5min(dt):
-    """Trunca um datetime para o multiplo de 5 min anterior, segundos = 0."""
+    """Trunca um datetime para o multiplo de 5 min anterior, segundos = 0.
+    Usado para alinhar o carimbo da Chint (ex: 13:45:16) ao slot (13:45:00)."""
     minuto = (dt.minute // 5) * 5
     return dt.replace(minute=minuto, second=0, microsecond=0)
 
@@ -197,15 +145,18 @@ def truncar_slot_5min(dt):
 def parse_data_chint(texto):
     """Converte texto de data em datetime EM UTC (naive). None se falhar.
 
-    Aceita:
+    Aceita os formatos que a Chint usa atualmente:
       'AAAA-MM-DD HH:MM:SS -0300'  (com offset)
       'AAAA-MM-DD HH:MM:SS'         (sem offset, assume BR)
       'AAAA-MM-DD HH:MM'            (sem segundos, assume BR)
-    Retorno SEMPRE em UTC (sem tzinfo)."""
+
+    O retorno e SEMPRE em UTC (sem tzinfo), para coerencia com o banco.
+    A API depois converte UTC -> BR para exibir."""
     if not texto:
         return None
     s = str(texto).strip()
 
+    # Detecta offset no final: " +HHMM" ou " -HHMM" (com ou sem espaco antes)
     offset_presente = False
     offset_hh = 0
     offset_mm = 0
@@ -227,175 +178,62 @@ def parse_data_chint(texto):
     if dt_local is None:
         return None
 
+    # Sem offset: assume BR (-3h). A Chint envia BR mesmo quando omite o offset,
+    # conforme o header time-zone que mandamos.
     if not offset_presente:
         offset_hh = -3
 
+    # Converte para UTC subtraindo o offset (BR -3 vira UTC somando 3h).
     return dt_local - timedelta(hours=offset_hh, minutes=offset_mm)
 
 
-# ============================================================
-# RESOLUCAO DE COLUNAS POR TITULO
-# ============================================================
-
-def extrair_cabecalho(data):
-    """Tenta achar, na resposta da Chint, a lista de TITULOS das colunas.
-    Retorna list[str] ou None se nao achar."""
+def _diagnosticar_indices(data):
+    """Imprime, para conferencia, o titulo que esta em cada indice fixo.
+    So roda quando DIAGNOSTICO_TITULOS = True e a Chint traz cabecalho.
+    Puramente informativo: NAO e usado para ler os dados."""
     d = data.get("data", {}) if isinstance(data, dict) else {}
-
+    header = None
     for chave in ("titleList", "headList", "titles", "head",
                   "columns", "columnList", "header", "headers",
                   "titleNameList", "colTitles"):
         v = d.get(chave)
-        if isinstance(v, list) and v and all(isinstance(x, (str, dict)) for x in v):
+        if isinstance(v, list) and v:
             if isinstance(v[0], dict):
-                titulos = [x.get("title") or x.get("name") or x.get("label") or ""
-                           for x in v]
-            else:
-                titulos = list(v)
-            if any(titulos):
-                return titulos
-
-    rows = d.get("dataList") or []
-    largura = len(rows[0]) if rows and isinstance(rows[0], list) else None
-    if largura:
-        for v in d.values():
-            if (isinstance(v, list) and len(v) == largura
-                    and all(isinstance(x, str) for x in v)):
-                return v
-    return None
-
-
-def detectar_coluna_data(rows, max_amostra=8):
-    """Acha, PELO VALOR, qual coluna contem o carimbo de hora da leitura.
-
-    Estrategia: para cada coluna, verifica se em todas as linhas da amostra
-    o valor parseia como data. Entre as colunas validas, prefere aquela cujos
-    valores VARIAM entre as linhas (o carimbo real muda de leitura para
-    leitura; uma coluna-isca de hora fixa nao varia). Se nenhuma variar
-    (ex.: so 1 leitura), usa a mais a esquerda.
-
-    Retorna o indice da coluna, ou None se nenhuma parsear como data."""
-    if not rows:
-        return None
-    amostra = [r for r in rows[:max_amostra] if r]
-    if not amostra:
-        return None
-
-    largura = max(len(r) for r in amostra)
-    candidatos = []  # (indice, varia_bool)
-    for c in range(largura):
-        valores = []
-        ok = True
-        for r in amostra:
-            if c >= len(r) or parse_data_chint(r[c]) is None:
-                ok = False
+                header = [x.get("title") or x.get("name") or x.get("label") or ""
+                          for x in v]
+            elif all(isinstance(x, str) for x in v):
+                header = list(v)
+            if header:
                 break
-            valores.append(r[c])
-        if ok:
-            candidatos.append((c, len(set(valores)) > 1))
-
-    if not candidatos:
-        return None
-    variaveis = [c for c, varia in candidatos if varia]
-    if variaveis:
-        return min(variaveis)
-    return candidatos[0][0]
-
-
-def construir_colmap(header):
-    """A partir dos titulos, monta {campo: indice} para os campos ESCALARES.
-    Um indice ja usado por um campo nao e reaproveitado por outro
-    (evita dois campos casarem na mesma coluna). Campos nao achados
-    ficam de fora (o chamador usa o fallback IDX_*)."""
     if not header:
-        return {}
+        print("  [diagnostico] resposta sem cabecalho — nada a conferir.")
+        return
 
-    titulos_norm = [_norm(t) for t in header]
-    colmap = {}
-    usados = set()
-
-    for campo, candidatos in MAPA_TITULOS.items():
-        achou = None
-        for cand in candidatos:
-            for idx, tnorm in enumerate(titulos_norm):
-                if idx in usados:
-                    continue
-                if _casa_candidato(tnorm, cand):
-                    achou = idx
-                    break
-            if achou is not None:
-                break
-        if achou is not None:
-            colmap[campo] = achou
-            usados.add(achou)
-    return colmap
+    rotulos = {
+        IDX_DATE: "DATE", IDX_TYIELD: "TYIELD", IDX_DYIELD: "DYIELD",
+        IDX_PAC: "PAC", IDX_FREQ: "FREQ", IDX_UMPPT1: "UMPPT1",
+        IDX_IMPPT1: "IMPPT1", IDX_IPV1: "IPV1", IDX_PDC: "PDC",
+        IDX_TMOD: "TMOD", IDX_TAMB: "TAMB", IDX_ISO: "ISO",
+    }
+    print("  [diagnostico] titulo em cada indice fixo:")
+    for idx in sorted(rotulos):
+        titulo = header[idx] if idx < len(header) else "<fora do cabecalho>"
+        print(f"    IDX_{rotulos[idx]:<7} = {idx:>3}  ->  {titulo}")
 
 
-def mapear_mppts_strings(header, topologia):
-    """Localiza, pelo titulo, as colunas de tensao/corrente de cada MPPT e
-    de corrente de cada string PV.
-
-    Retorna (mppt_v_idx, mppt_i_idx, pv_i_idx) — listas de indices (0-based
-    por canal), com None onde nao achou.
-
-    Heuristica: o titulo de um canal contem o numero do canal e uma palavra
-    que diz se e tensao ou corrente. Ex.: 'Umppt1', 'Impp1', 'Upv1', 'Ipv1',
-    'Tensao MPPT1', 'Corrente PV3', etc."""
-    num_mppt   = topologia["num_mppt"]
-    num_string = topologia["num_string"]
-
-    mppt_v_idx = [None] * num_mppt
-    mppt_i_idx = [None] * num_mppt
-    pv_i_idx   = [None] * num_string
-
-    if not header:
-        return mppt_v_idx, mppt_i_idx, pv_i_idx
-
-    def eh_tensao(t):
-        return (any(p in t for p in ("tensao", "voltage", "volt"))
-                or re.search(r"\bu\s*(mppt|pv|str)", t) is not None)
-
-    def eh_corrente(t):
-        return (any(p in t for p in ("corrente", "current"))
-                or re.search(r"\bi\s*(mppt|pv|str)", t) is not None)
-
-    def numero_de(t):
-        nums = re.findall(r"\d+", t)
-        return int(nums[-1]) if nums else None
-
-    for idx, titulo in enumerate(header):
-        t = _norm(titulo)
-        if not t:
-            continue
-        n = numero_de(t)
-        if n is None:
-            continue
-
-        eh_mppt = "mppt" in t
-        eh_pv   = ("pv" in t) or ("string" in t) or ("str" in t and "mppt" not in t)
-
-        if eh_mppt:
-            mi = n - 1
-            if 0 <= mi < num_mppt:
-                if eh_tensao(t) and mppt_v_idx[mi] is None:
-                    mppt_v_idx[mi] = idx
-                elif eh_corrente(t) and mppt_i_idx[mi] is None:
-                    mppt_i_idx[mi] = idx
-        elif eh_pv:
-            si = n - 1
-            if 0 <= si < num_string and eh_corrente(t) and pv_i_idx[si] is None:
-                pv_i_idx[si] = idx
-
-    return mppt_v_idx, mppt_i_idx, pv_i_idx
-
+# ============================================================
+# BUSCA NA CHINT
+# ============================================================
 
 def buscar_leituras_validas(asset_id):
-    """Busca na Chint as ultimas leituras multiplas de 5 (ignora fora-de-grid),
-    ja convertidas para UTC.
+    """Busca na Chint as ultimas leituras e retorna TODAS as que sao
+    multiplas de 5 (ignorando as 'fora-de-grid'), ja convertidas para UTC.
 
-    Retorna (header, validas):
-      header  -> lista de titulos (ou None)
-      validas -> lista de (ts_utc, row), da mais recente p/ a mais antiga."""
+    Retorna uma lista de tuplas (ts_utc, row), ordenada da mais recente
+    para a mais antiga (a Chint ja devolve assim).
+
+    Pede limit=15 para ter margem caso varias leituras sejam fora-de-grid
+    e precisem ser descartadas (sobra ainda a mais recente valida)."""
     hoje_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d")
     url = (
         f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
@@ -409,83 +247,66 @@ def buscar_leituras_validas(asset_id):
         raise ValueError(f"API Chint retornou erro: {data.get('msg')}")
     rows = data.get("data", {}).get("dataList") or []
 
-    header = extrair_cabecalho(data)
-
-    # Carimbo de hora: detecta por VALOR (robusto a reordenacao e a colunas-isca
-    # como 'TimeSet'). Fallbacks: titulo, depois IDX_DATE.
-    idx_data = detectar_coluna_data(rows)
-    if idx_data is None and header:
-        idx_data = construir_colmap(header).get("data")
-    if idx_data is None:
-        idx_data = IDX_DATE
+    if DIAGNOSTICO_TITULOS:
+        _diagnosticar_indices(data)
 
     validas = []
     for row in rows:
         if not row:
             continue
-        ts = parse_data_chint(row[idx_data]) if idx_data < len(row) else None
+        ts = parse_data_chint(row[IDX_DATE]) if IDX_DATE < len(row) else None
         if ts is None:
             continue
-        if ts.minute % 5 != 0:   # ignora fora-de-grid
+        # Ignora fora-de-grid: so minuto multiplo de 5
+        if ts.minute % 5 != 0:
             continue
         validas.append((ts, row))
-    return header, validas
+    return validas
 
 
-def extrair_dados(row, topologia, header=None):
-    """Converte uma row da API Chint nos campos principais + canais.
+# ============================================================
+# EXTRACAO DOS DADOS (por INDICE FIXO)
+# ============================================================
 
-    'header' (opcional): titulos das colunas. Se presente, cada coluna e
-    localizada pelo TITULO; senao, usa o fallback dos indices fixos IDX_*.
+def extrair_dados(row, topologia):
+    """Converte uma row da API Chint nos campos principais + canais,
+    lendo cada valor pelo seu INDICE FIXO.
 
-    Retorna (status, campos, mppts, strings)."""
+    'topologia' descreve o modelo do inversor:
+        {"num_mppt": int,
+         "num_string": int,
+         "strings_por_mppt": {mppt_n: qtd, ...}}
+
+    Retorna: (status, campos, mppts, strings)
+      mppts   -> lista de {mppt, tensao_v, corrente_a, potencia_w}
+      strings -> lista de {string_num, mppt, corrente_a, potencia_w}
+    """
     num_mppt = topologia["num_mppt"]
 
-    colmap = construir_colmap(header) if header else {}
-
-    fallback = {
-        "pac_kw":     IDX_PAC,
-        "dyield_kwh": IDX_DYIELD,
-        "tyield_kwh": IDX_TYIELD,
-        "freq_hz":    IDX_FREQ,
-        "tmod_c":     IDX_TMOD,
-        "tamb_c":     IDX_TAMB,
-        "iso_kohm":   IDX_ISO,
-        "pdc_kw":     IDX_PDC,
-    }
-
-    def ler(campo):
-        idx = colmap.get(campo, fallback[campo])
-        return safe_float(row[idx]) if idx is not None and idx < len(row) else 0.0
+    def ler(idx):
+        """Le um indice fixo com seguranca (0.0 se faltar na row)."""
+        return safe_float(row[idx]) if idx < len(row) else 0.0
 
     campos = {
-        "pac_kw":     ler("pac_kw")    / 1000.0,   # W -> kW
-        "dyield_kwh": ler("dyield_kwh") / 1000.0,  # Wh -> kWh
-        "tyield_kwh": ler("tyield_kwh"),           # ja em kWh
-        "freq_hz":    ler("freq_hz"),
-        "tmod_c":     ler("tmod_c"),
-        "tamb_c":     ler("tamb_c"),
-        "iso_kohm":   ler("iso_kohm"),
-        "pdc_kw":     ler("pdc_kw"),
+        "pac_kw":     ler(IDX_PAC)    / 1000.0,   # W -> kW
+        "dyield_kwh": ler(IDX_DYIELD) / 1000.0,   # Wh -> kWh
+        "tyield_kwh": ler(IDX_TYIELD),            # ja em kWh
+        "freq_hz":    ler(IDX_FREQ),
+        "tmod_c":     ler(IDX_TMOD),
+        "tamb_c":     ler(IDX_TAMB),
+        "iso_kohm":   ler(IDX_ISO),
+        "pdc_kw":     ler(IDX_PDC),
     }
 
-    if header:
-        mppt_v_idx, mppt_i_idx, pv_i_idx = mapear_mppts_strings(header, topologia)
-    else:
-        mppt_v_idx = mppt_i_idx = pv_i_idx = None
-
-    # ---- MPPTs ----
+    # ---- MPPTs: tensao e corrente ----
+    # Layout fixo: U,I,U,I,... a partir de IDX_UMPPT1/IDX_IMPPT1, +2 por MPPT.
     mppt_v = []
     mppts  = []
     for m in range(num_mppt):
-        if mppt_v_idx is not None:
-            v_idx = mppt_v_idx[m]
-            i_idx = mppt_i_idx[m]
-        else:
-            v_idx = IDX_UMPPT1 + m * 2
-            i_idx = IDX_IMPPT1 + m * 2
-        v = safe_float(row[v_idx]) if (v_idx is not None and v_idx < len(row)) else 0.0
-        i = safe_float(row[i_idx]) if (i_idx is not None and i_idx < len(row)) else 0.0
+        v_idx = IDX_UMPPT1 + m * 2
+        i_idx = IDX_IMPPT1 + m * 2
+        v = ler(v_idx)
+        i = ler(i_idx)
         mppt_v.append(v)
         mppts.append({
             "mppt": m + 1,
@@ -494,18 +315,17 @@ def extrair_dados(row, topologia, header=None):
         })
 
     # ---- Strings PV ----
+    # Percorre os MPPTs na ordem; para cada um, le quantas strings ele tem
+    # (vem da topologia do modelo). A string nao tem tensao propria: usa a do
+    # MPPT pai. A corrente avanca sequencialmente a partir de IDX_IPV1.
     strings = []
-    string_num = 0
-    idx_corrente = 0
+    string_num = 0          # numero global da string (1..num_string)
+    idx_corrente = 0        # deslocamento dentro do bloco IDX_IPV1
     for m in range(num_mppt):
         qtd = topologia["strings_por_mppt"].get(m + 1, 0)
         upv = mppt_v[m] if m < len(mppt_v) else 0.0
         for _ in range(qtd):
-            if pv_i_idx is not None:
-                i_idx = pv_i_idx[string_num] if string_num < len(pv_i_idx) else None
-            else:
-                i_idx = IDX_IPV1 + idx_corrente
-            ipv = safe_float(row[i_idx]) if (i_idx is not None and i_idx < len(row)) else 0.0
+            ipv = ler(IDX_IPV1 + idx_corrente)
             string_num += 1
             strings.append({
                 "string_num": string_num,
@@ -545,7 +365,11 @@ def canais_zerados(topologia):
 # ============================================================
 
 def carregar_topologias(cur):
-    """Le, para cada modelo de inversor, a sua topologia."""
+    """Le, para cada modelo de inversor, a sua topologia.
+    Retorna: modelo_id -> {
+        "num_mppt": int, "num_string": int,
+        "strings_por_mppt": {mppt_n: qtd, ...}
+    }"""
     cur.execute("SELECT id, num_mppt, num_string FROM modelo_inversor")
     topologias = {}
     for modelo_id, num_mppt, num_string in cur.fetchall():
@@ -629,7 +453,7 @@ def main():
     agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
 
     print("=" * 60)
-    print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
+    print(f"COLETOR v3 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
     print(f"  Aguardando {DELAY_SEGUNDOS}s para a Chint propagar o slot...")
     time.sleep(DELAY_SEGUNDOS)
 
@@ -676,7 +500,7 @@ def main():
                 continue
 
             try:
-                header, validas = buscar_leituras_validas(asset_id)
+                validas = buscar_leituras_validas(asset_id)
             except Exception as e:
                 print(f"  [{nome}] ERRO de API: {e}")
                 n_erro += 1
@@ -690,7 +514,7 @@ def main():
             ts_chint, row = validas[0]
             ts_grava = truncar_slot_5min(ts_chint)
 
-            status, campos, mppts, strings = extrair_dados(row, topo, header)
+            status, campos, mppts, strings = extrair_dados(row, topo)
             gravar_leitura(cur, inv_id, ts_grava, status,
                            campos, mppts, strings)
             total_pac += campos["pac_kw"]
