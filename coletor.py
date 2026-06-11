@@ -6,7 +6,7 @@
 Le os inversores de uma usina na API da Chint e grava as
 leituras no banco PostgreSQL (schema v2).
 
-CORRECAO (esta versao) — coleta por TITULO, nao por posicao:
+Coleta por TITULO, nao por posicao:
   - Cada coluna da resposta da Chint e localizada pelo seu
     TITULO no cabecalho que a API devolve. Se a Chint
     reordenar/inserir colunas, o coletor continua pegando o
@@ -79,10 +79,6 @@ DELAY_SEGUNDOS = 20
 # Fuso do Brasil (a Chint publica no fuso de Sao Paulo; o Railway roda em UTC)
 FUSO_BR = timezone(timedelta(hours=-3))
 
-# Imprime o cabecalho (titulos + valor de amostra) uma vez por execucao,
-# para diagnostico/conferencia. Deixe True ate confirmar o mapeamento.
-LOG_CABECALHO = True
-
 
 # ============================================================
 # FALLBACK — indices fixos antigos da resposta da API Chint
@@ -112,12 +108,6 @@ IDX_ISO    = 117
 # acento, CamelCase quebrado) que TODAS precisam aparecer no
 # titulo da coluna. A ordem importa: o 1o candidato que casar
 # vence — coloque os mais especificos primeiro.
-#
-# Observado no log da Chint (estilo compacto com unidade):
-#   Pac(W)  Freq(Hz)  Pdc(kW)  Tamb(°C)  ISO(kΩ)  PVInputMode  TimeSet
-# Geracao diaria/total e Tmod ainda nao confirmados nominalmente;
-# os candidatos abaixo cobrem o padrao usual (Eday/Etoday/Etotal,
-# Tmod). Se algum cair em fallback, o log mostra o titulo real.
 # ============================================================
 MAPA_TITULOS = {
     # 'data' aqui e so reforco; a deteccao principal e por VALOR.
@@ -403,10 +393,9 @@ def buscar_leituras_validas(asset_id):
     """Busca na Chint as ultimas leituras multiplas de 5 (ignora fora-de-grid),
     ja convertidas para UTC.
 
-    Retorna (header, idx_data, validas):
-      header   -> lista de titulos (ou None)
-      idx_data -> indice da coluna do carimbo de hora (detectado por valor)
-      validas  -> lista de (ts_utc, row), da mais recente p/ a mais antiga."""
+    Retorna (header, validas):
+      header  -> lista de titulos (ou None)
+      validas -> lista de (ts_utc, row), da mais recente p/ a mais antiga."""
     hoje_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d")
     url = (
         f"{BASE}/openApi/v1/deviceData/deviceDataPageList"
@@ -440,7 +429,7 @@ def buscar_leituras_validas(asset_id):
         if ts.minute % 5 != 0:   # ignora fora-de-grid
             continue
         validas.append((ts, row))
-    return header, idx_data, validas
+    return header, validas
 
 
 def extrair_dados(row, topologia, header=None):
@@ -633,56 +622,6 @@ def gravar_leitura(cur, inversor_id, ts, status, campos, mppts, strings):
 
 
 # ============================================================
-# DIAGNOSTICO — imprime cabecalho, valores de amostra e mapeamento
-# ============================================================
-
-def logar_diagnostico(header, idx_data, sample_row, topo):
-    """Imprime, uma vez por execucao, os titulos da Chint com um valor de
-    amostra ao lado, o carimbo de hora detectado e o mapeamento resolvido.
-    Util para confirmar/ajustar o MAPA_TITULOS."""
-    if not header:
-        print("  AVISO: resposta da Chint SEM cabecalho de titulos; "
-              "usando indices fixos (fallback IDX_*).")
-        print(f"  Carimbo de hora detectado por valor -> indice {idx_data}")
-        return
-
-    def amostra(j):
-        if sample_row and j < len(sample_row):
-            return str(sample_row[j])
-        return "-"
-
-    print("  --- CABECALHO DA CHINT (indice | titulo = valor) ---")
-    for j, titulo in enumerate(header):
-        print(f"      [{j:3d}] {titulo} = {amostra(j)}")
-
-    print(f"  --- CARIMBO DE HORA detectado por valor -> indice {idx_data} "
-          f"({header[idx_data] if idx_data < len(header) else '?'}) ---")
-
-    cm = construir_colmap(header)
-    print("  --- MAPEAMENTO RESOLVIDO (campo -> indice) ---")
-    for campo in ("pac_kw", "dyield_kwh", "tyield_kwh", "freq_hz",
-                  "pdc_kw", "tmod_c", "tamb_c", "iso_kohm"):
-        idx = cm.get(campo)
-        if idx is not None:
-            ttl = header[idx] if idx < len(header) else "?"
-            print(f"      {campo:12s} -> idx {idx:>4d}  [{ttl}] = {amostra(idx)}")
-        else:
-            fb = {"pac_kw": IDX_PAC, "dyield_kwh": IDX_DYIELD,
-                  "tyield_kwh": IDX_TYIELD, "freq_hz": IDX_FREQ,
-                  "pdc_kw": IDX_PDC, "tmod_c": IDX_TMOD,
-                  "tamb_c": IDX_TAMB, "iso_kohm": IDX_ISO}[campo]
-            ttl = header[fb] if fb < len(header) else "?"
-            print(f"      {campo:12s} -> idx None  (NAO ACHOU; fallback {fb} "
-                  f"[{ttl}] = {amostra(fb)})")
-
-    vmap, imap, pvmap = mapear_mppts_strings(header, topo)
-    print(f"      MPPT tensao   idx: {vmap}")
-    print(f"      MPPT corrente idx: {imap}")
-    print(f"      String corr.  idx: {pvmap}")
-    print("  ----------------------------------------------------")
-
-
-# ============================================================
 # CICLO DE COLETA — roda UMA vez
 # ============================================================
 
@@ -728,7 +667,6 @@ def main():
         n_online  = 0
         n_pulado  = 0
         n_erro    = 0
-        diagnostico_feito = False
 
         for inv_id, nome, asset_id, modelo_id in inversores:
             topo = topologias.get(modelo_id)
@@ -738,16 +676,11 @@ def main():
                 continue
 
             try:
-                header, idx_data, validas = buscar_leituras_validas(asset_id)
+                header, validas = buscar_leituras_validas(asset_id)
             except Exception as e:
                 print(f"  [{nome}] ERRO de API: {e}")
                 n_erro += 1
                 continue
-
-            if LOG_CABECALHO and not diagnostico_feito:
-                diagnostico_feito = True
-                sample = validas[0][1] if validas else None
-                logar_diagnostico(header, idx_data, sample, topo)
 
             if not validas:
                 print(f"  [{nome}] sem leitura valida (Chint sem multiplo de 5)")
