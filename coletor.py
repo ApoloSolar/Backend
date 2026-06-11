@@ -18,36 +18,19 @@ NOVIDADES DA v2 (schema v2):
   - 'leitura_mppt' e 'leitura_string' guardam o inversor_id
     diretamente; a string guarda tambem o MPPT a que pertence.
 
+CORRECAO (esta versao):
+  - A leitura das colunas da resposta da Chint NAO usa mais
+    posicoes fixas (IDX_*). Agora cada coluna e localizada
+    pelo seu TITULO no cabecalho que a API devolve. Assim,
+    se a Chint reordenar ou inserir colunas, o coletor
+    continua pegando o dado certo.
+  - Os IDX_* antigos viraram apenas FALLBACK: so sao usados
+    se a resposta nao trouxer cabecalho. Quando o cabecalho
+    existe, ele manda.
+
 COMO RODA:
   - Roda UMA vez e encerra. O Railway repete a cada 5 min
     via cron job.
-  - O cron deve disparar 1 minuto APOS a postagem da Chint
-    (ex: cron em XX:01/XX:06/...; cronSchedule "1-59/5 * * * *"),
-    porque a Chint posta o slot em XX:00:16 e leva alguns
-    segundos para propagar a leitura entre TODOS os inversores.
-    Disparar em XX:01 garante que o slot recem-postado ja
-    esteja disponivel em todos eles.
-
-SLOT ALVO (correcao da coleta incompleta):
-  - Em vez de cada inversor gravar "a sua leitura mais recente"
-    (o que, numa corrida de propagacao, fazia uns gravarem o
-    slot novo e outros o anterior — deixando buracos no slot
-    atual), o ciclo calcula UM slot alvo unico e TODOS os
-    inversores miram esse mesmo slot. Quem ainda nao tiver o
-    slot e pulado e logado, em vez de regravar silenciosamente
-    o slot anterior.
-
-SNAPSHOT PARCIAL (correcao de leitura ~0 espuria):
-  - As vezes a Chint publica o slot alvo para um inversor, mas
-    com o Pac ainda zerado (snapshot parcial / nao consolidado),
-    mesmo com o inversor em 'Running'. Gravar isso geraria um
-    falso ~0 (o inversor aparece "zerado" no dashboard enquanto
-    na verdade esta gerando ~230 kW). O ciclo agora detecta
-    'Running + Pac~0', trata como NAO consolidado e pula o
-    inversor naquele ciclo, preservando a ultima leitura boa.
-    Um inversor realmente parado (Waiting/Standby/Fault/Off, ou
-    de noite) tem Mode != Running e passa normal, gravando o
-    zero legitimo.
 
 CREDENCIAIS — lidas de variaveis de ambiente no Railway:
   DATABASE_URL   -> string de conexao do PostgreSQL
@@ -64,6 +47,8 @@ import json
 import os
 import re
 import sys
+import time
+import unicodedata
 
 import psycopg
 
@@ -100,17 +85,34 @@ HEADERS = {
 # Slug da usina deste coletor (deve existir na tabela 'usina')
 USINA_SLUG = "pk"
 
+# Espera no inicio de cada execucao, em segundos, antes de consultar a Chint.
+# O cron dispara em horarios multiplos de 5 (XX:00, XX:05, ...), mas a Chint
+# leva alguns segundos para propagar a leitura do slot atual entre todos os
+# inversores. Esperar antes de consultar evita pegar o slot anterior por
+# corrida de timing.
+DELAY_SEGUNDOS = 20
+
 # Fuso do Brasil (a Chint publica no fuso de Sao Paulo conforme o header
 # 'time-zone' que enviamos; o Railway roda em UTC, entao precisamos converter)
 FUSO_BR = timezone(timedelta(hours=-3))
 
-# ---- indices dos campos na resposta da API Chint ----
+# Imprime o cabecalho (titulos das colunas) da Chint uma vez por execucao,
+# para diagnostico/conferencia. Deixe True ate confirmar o mapeamento.
+LOG_CABECALHO = True
+
+
+# ============================================================
+# FALLBACK — indices fixos antigos da resposta da API Chint
+# ------------------------------------------------------------
+# SO usados quando a resposta NAO traz cabecalho de titulos.
+# Com cabecalho presente, a resolucao por TITULO (abaixo) tem
+# prioridade e estes numeros sao ignorados.
+# ============================================================
 IDX_DATE   = 0           # carimbo da Chint, ex: "2026-05-27 13:45:16"
 IDX_TYIELD = 4
 IDX_DYIELD = 5
 IDX_PAC    = 10
 IDX_FREQ   = 18
-IDX_MODE   = 28          # 'Mode' -> 'Running', 'Waiting', 'Fault', 'Off', ...
 IDX_UMPPT1 = 40
 IDX_IMPPT1 = 41
 IDX_IPV1   = 64
@@ -119,12 +121,60 @@ IDX_TMOD   = 115
 IDX_TAMB   = 116
 IDX_ISO    = 117
 
-# Pac minimo (kW) para uma leitura "Running" ser considerada consolidada.
-# Abaixo disso, com o inversor em Running, a row e tratada como snapshot
-# PARCIAL da Chint (slot publicado mas Pac ainda nao consolidado) e descartada,
-# para nao gravar um zero falso. Ajuste se a frota usar outro valor de 'Mode'
-# para "gerando", ou se houver leituras legitimas sustentadas abaixo de 1 kW.
-PAC_MIN_RUNNING_KW = 1.0
+
+# ============================================================
+# MAPA DE TITULOS — palavras-chave para casar cada campo
+# ------------------------------------------------------------
+# Para cada campo, uma lista de "candidatos". Cada candidato e
+# uma lista de palavras-chave (ja normalizadas: minusculas, sem
+# acento) que TODAS precisam aparecer no titulo da coluna para
+# considerar que aquela coluna e o campo.
+#
+# A ordem importa: o 1o candidato que casar vence. Coloque os
+# mais especificos primeiro.
+#
+# >>> AJUSTE AQUI depois de ver o cabecalho real impresso no log.
+#     Os termos abaixo cobrem variacoes comuns (PT/EN), mas
+#     confirme com os titulos que a Chint realmente devolve.
+# ============================================================
+MAPA_TITULOS = {
+    "data": [
+        ["tempo", "atualiz"], ["data", "hora"], ["update", "time"],
+        ["hora"], ["data"], ["time"],
+    ],
+    "tyield_kwh": [
+        ["geracao", "total"], ["energia", "total"],
+        ["producao", "total"], ["total", "yield"], ["e", "total"],
+    ],
+    "dyield_kwh": [
+        ["geracao", "dia"], ["geracao", "diaria"], ["energia", "dia"],
+        ["energia", "diaria"], ["producao", "dia"], ["daily", "yield"],
+        ["e", "hoje"], ["e", "dia"],
+    ],
+    "pac_kw": [
+        ["potencia", "ativa"], ["potencia", "saida"], ["potencia", "ca"],
+        ["potencia", "ac"], ["pac"], ["active", "power"],
+    ],
+    "freq_hz": [
+        ["frequencia", "rede"], ["frequencia"], ["freq"], ["frequency"],
+    ],
+    "pdc_kw": [
+        ["potencia", "cc"], ["potencia", "dc"], ["potencia", "entrada"],
+        ["pdc"], ["dc", "power"], ["input", "power"],
+    ],
+    "tmod_c": [
+        ["temperatura", "modulo"], ["temp", "modulo"], ["temperatura", "painel"],
+        ["module", "temp"], ["tmod"],
+    ],
+    "tamb_c": [
+        ["temperatura", "ambiente"], ["temp", "ambiente"],
+        ["ambient", "temp"], ["tamb"],
+    ],
+    "iso_kohm": [
+        ["resistencia", "isolamento"], ["impedancia", "isolamento"],
+        ["isolamento"], ["insulation", "resist"], ["iso"],
+    ],
+}
 
 
 # ============================================================
@@ -141,16 +191,22 @@ def safe_float(val):
         return 0.0
 
 
-def leitura_parcial(row):
-    """True se a row parece um snapshot PARCIAL da Chint: o inversor diz
-    estar 'Running' mas o Pac veio ~0 (slot publicado, ainda nao consolidado).
+def _norm(texto):
+    """Normaliza um titulo para comparar: minusculas, sem acento,
+    sem caracteres especiais (vira espaco)."""
+    if texto is None:
+        return ""
+    s = str(texto)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return s.strip()
 
-    So 'Running + Pac~0' e tratado como suspeito. Um inversor realmente
-    parado (Waiting/Standby/Fault/Off, ou de noite) tem Mode != Running e
-    passa normalmente, gravando o zero legitimo."""
-    modo = str(row[IDX_MODE] or "").strip().lower() if IDX_MODE < len(row) else ""
-    pac_kw = safe_float(row[IDX_PAC]) / 1000.0
-    return modo == "running" and pac_kw < PAC_MIN_RUNNING_KW
+
+def _casa_candidato(titulo_norm, candidato):
+    """True se TODAS as palavras-chave do candidato aparecem no titulo."""
+    return all(kw in titulo_norm for kw in candidato)
 
 
 def truncar_slot_5min(dt):
@@ -205,12 +261,154 @@ def parse_data_chint(texto):
     return dt_local - timedelta(hours=offset_hh, minutes=offset_mm)
 
 
+# ============================================================
+# RESOLUCAO DE COLUNAS POR TITULO
+# ============================================================
+
+def extrair_cabecalho(data):
+    """Tenta achar, na resposta da Chint, a lista de TITULOS das colunas.
+
+    A Chint nomeia esse campo de formas diferentes conforme a versao
+    da API. Tentamos as chaves conhecidas, e por ultimo procuramos
+    qualquer lista de strings com tamanho coerente.
+
+    Retorna a lista de titulos (list[str]) ou None se nao achar.
+    """
+    d = data.get("data", {}) if isinstance(data, dict) else {}
+
+    # Chaves candidatas (a 1a que existir e for lista nao-vazia vence)
+    for chave in ("titleList", "headList", "titles", "head",
+                  "columns", "columnList", "header", "headers",
+                  "titleNameList", "colTitles"):
+        v = d.get(chave)
+        if isinstance(v, list) and v and all(isinstance(x, (str, dict)) for x in v):
+            # Alguns formatos trazem [{"title": "..."}], outros ["..."]
+            if isinstance(v[0], dict):
+                titulos = [x.get("title") or x.get("name") or x.get("label") or ""
+                           for x in v]
+            else:
+                titulos = list(v)
+            if any(titulos):
+                return titulos
+
+    # Ultimo recurso: procurar uma lista de strings com tamanho parecido
+    # com o das linhas de dados (mesma largura do dataList).
+    rows = d.get("dataList") or []
+    largura = len(rows[0]) if rows and isinstance(rows[0], list) else None
+    if largura:
+        for v in d.values():
+            if (isinstance(v, list) and len(v) == largura
+                    and all(isinstance(x, str) for x in v)):
+                return v
+
+    return None
+
+
+def construir_colmap(header):
+    """A partir da lista de titulos, monta o mapeamento campo -> indice
+    para os campos ESCALARES (pac, dyield, etc.).
+
+    Retorna um dict: {campo: indice}. Campos nao encontrados ficam de
+    fora (o chamador usa o fallback IDX_* nesses casos).
+    """
+    if not header:
+        return {}
+
+    titulos_norm = [_norm(t) for t in header]
+    colmap = {}
+
+    for campo, candidatos in MAPA_TITULOS.items():
+        achou = None
+        # Tenta candidato a candidato, na ordem (mais especifico primeiro)
+        for cand in candidatos:
+            for idx, tnorm in enumerate(titulos_norm):
+                if idx in colmap.values():
+                    pass  # nao bloqueia: um titulo pode servir 1 campo so
+                if _casa_candidato(tnorm, cand):
+                    achou = idx
+                    break
+            if achou is not None:
+                break
+        if achou is not None:
+            colmap[campo] = achou
+
+    return colmap
+
+
+def mapear_mppts_strings(header, topologia):
+    """Localiza, pelo titulo, as colunas de tensao/corrente de cada MPPT
+    e de corrente de cada string PV.
+
+    Retorna:
+      mppt_v_idx[m]  -> indice da coluna de TENSAO do MPPT m (0-based m)
+      mppt_i_idx[m]  -> indice da coluna de CORRENTE do MPPT m
+      pv_i_idx[s]    -> indice da coluna de CORRENTE da string PV s (0-based s)
+    Indices ausentes ficam como None.
+
+    Heuristica: o titulo de um canal MPPT/PV costuma conter o numero do
+    canal e uma palavra que diz se e tensao ou corrente. Ex.:
+      "Tensao MPPT1", "Corrente MPPT1", "Tensao PV1", "Corrente PV3",
+      "Upv1", "Ipv1", "U MPPT 2", "I PV 5", etc.
+    """
+    num_mppt   = topologia["num_mppt"]
+    num_string = topologia["num_string"]
+
+    mppt_v_idx = [None] * num_mppt
+    mppt_i_idx = [None] * num_mppt
+    pv_i_idx   = [None] * num_string
+
+    if not header:
+        return mppt_v_idx, mppt_i_idx, pv_i_idx
+
+    PAL_TENSAO   = ("tensao", "voltage", "volt", "u ")   # 'u ' p/ Upv/Umppt
+    PAL_CORRENTE = ("corrente", "current", "amp", "i ")  # 'i ' p/ Ipv/Imppt
+
+    def eh_tensao(t):
+        return (any(p in t for p in ("tensao", "voltage", "volt"))
+                or re.search(r"\bu\s*(mppt|pv|str)", t) is not None)
+
+    def eh_corrente(t):
+        return (any(p in t for p in ("corrente", "current"))
+                or re.search(r"\bi\s*(mppt|pv|str)", t) is not None)
+
+    def numero_de(t):
+        """Extrai o numero do canal do titulo (o ultimo numero presente)."""
+        nums = re.findall(r"\d+", t)
+        return int(nums[-1]) if nums else None
+
+    for idx, titulo in enumerate(header):
+        t = _norm(titulo)
+        if not t:
+            continue
+        n = numero_de(t)
+        if n is None:
+            continue
+
+        eh_mppt = "mppt" in t
+        eh_pv   = ("pv" in t) or ("string" in t) or ("str" in t and "mppt" not in t)
+
+        if eh_mppt:
+            mi = n - 1  # canal 1-based -> indice 0-based
+            if 0 <= mi < num_mppt:
+                if eh_tensao(t) and mppt_v_idx[mi] is None:
+                    mppt_v_idx[mi] = idx
+                elif eh_corrente(t) and mppt_i_idx[mi] is None:
+                    mppt_i_idx[mi] = idx
+        elif eh_pv:
+            si = n - 1
+            if 0 <= si < num_string and eh_corrente(t) and pv_i_idx[si] is None:
+                pv_i_idx[si] = idx
+
+    return mppt_v_idx, mppt_i_idx, pv_i_idx
+
+
 def buscar_leituras_validas(asset_id):
     """Busca na Chint as ultimas leituras e retorna TODAS as que sao
     multiplas de 5 (ignorando as 'fora-de-grid'), ja convertidas para UTC.
 
-    Retorna uma lista de tuplas (ts_utc, row), ordenada da mais recente
-    para a mais antiga (a Chint ja devolve assim).
+    Retorna (header, validas):
+      header  -> lista de titulos das colunas (ou None se a API nao trouxe)
+      validas -> lista de tuplas (ts_utc, row), da mais recente p/ a mais antiga.
 
     Pede limit=15 para ter margem caso varias leituras sejam fora-de-grid
     e precisem ser descartadas (sobra ainda a mais recente valida)."""
@@ -227,21 +425,30 @@ def buscar_leituras_validas(asset_id):
         raise ValueError(f"API Chint retornou erro: {data.get('msg')}")
     rows = data.get("data", {}).get("dataList") or []
 
+    header = extrair_cabecalho(data)
+
+    # Indice da coluna de data: por titulo (se houver), senao fallback IDX_DATE
+    idx_data = IDX_DATE
+    if header:
+        cm = construir_colmap(header)
+        if "data" in cm:
+            idx_data = cm["data"]
+
     validas = []
     for row in rows:
         if not row:
             continue
-        ts = parse_data_chint(row[IDX_DATE]) if IDX_DATE < len(row) else None
+        ts = parse_data_chint(row[idx_data]) if idx_data < len(row) else None
         if ts is None:
             continue
         # Ignora fora-de-grid: so minuto multiplo de 5
         if ts.minute % 5 != 0:
             continue
         validas.append((ts, row))
-    return validas
+    return header, validas
 
 
-def extrair_dados(row, topologia):
+def extrair_dados(row, topologia, header=None):
     """Converte uma row da API Chint nos campos principais + canais.
 
     'topologia' descreve o modelo do inversor:
@@ -249,31 +456,64 @@ def extrair_dados(row, topologia):
          "num_string": int,
          "strings_por_mppt": {mppt_n: qtd, ...}}
 
+    'header' (opcional) e a lista de titulos das colunas. Se presente,
+    cada coluna e localizada pelo TITULO. Se ausente (None), usa o
+    fallback dos indices fixos IDX_*.
+
     Retorna: (status, campos, mppts, strings)
       mppts   -> lista de {mppt, tensao_v, corrente_a, potencia_w}
       strings -> lista de {string_num, mppt, corrente_a, potencia_w}
     """
     num_mppt = topologia["num_mppt"]
 
-    campos = {
-        "pac_kw":     safe_float(row[IDX_PAC])    / 1000.0,   # W -> kW
-        "dyield_kwh": safe_float(row[IDX_DYIELD]) / 1000.0,   # Wh -> kWh
-        "tyield_kwh": safe_float(row[IDX_TYIELD]),            # ja em kWh
-        "freq_hz":    safe_float(row[IDX_FREQ]),
-        "tmod_c":     safe_float(row[IDX_TMOD]),
-        "tamb_c":     safe_float(row[IDX_TAMB]),
-        "iso_kohm":   safe_float(row[IDX_ISO]),
-        "pdc_kw":     safe_float(row[IDX_PDC]),
+    # ---- resolve indices dos campos escalares ----
+    colmap = construir_colmap(header) if header else {}
+
+    # indice efetivo: titulo (se achou) senao fallback fixo
+    fallback = {
+        "pac_kw":     IDX_PAC,
+        "dyield_kwh": IDX_DYIELD,
+        "tyield_kwh": IDX_TYIELD,
+        "freq_hz":    IDX_FREQ,
+        "tmod_c":     IDX_TMOD,
+        "tamb_c":     IDX_TAMB,
+        "iso_kohm":   IDX_ISO,
+        "pdc_kw":     IDX_PDC,
     }
+
+    def ler(campo):
+        idx = colmap.get(campo, fallback[campo])
+        return safe_float(row[idx]) if idx is not None and idx < len(row) else 0.0
+
+    campos = {
+        "pac_kw":     ler("pac_kw")    / 1000.0,   # W -> kW
+        "dyield_kwh": ler("dyield_kwh") / 1000.0,  # Wh -> kWh
+        "tyield_kwh": ler("tyield_kwh"),           # ja em kWh
+        "freq_hz":    ler("freq_hz"),
+        "tmod_c":     ler("tmod_c"),
+        "tamb_c":     ler("tamb_c"),
+        "iso_kohm":   ler("iso_kohm"),
+        "pdc_kw":     ler("pdc_kw"),
+    }
+
+    # ---- resolve indices dos canais MPPT / string ----
+    if header:
+        mppt_v_idx, mppt_i_idx, pv_i_idx = mapear_mppts_strings(header, topologia)
+    else:
+        mppt_v_idx = mppt_i_idx = pv_i_idx = None
 
     # ---- MPPTs: tensao e corrente ----
     mppt_v = []
     mppts  = []
     for m in range(num_mppt):
-        v_idx = IDX_UMPPT1 + m * 2
-        i_idx = IDX_IMPPT1 + m * 2
-        v = safe_float(row[v_idx]) if v_idx < len(row) else 0.0
-        i = safe_float(row[i_idx]) if i_idx < len(row) else 0.0
+        if mppt_v_idx is not None:
+            v_idx = mppt_v_idx[m]
+            i_idx = mppt_i_idx[m]
+        else:
+            v_idx = IDX_UMPPT1 + m * 2
+            i_idx = IDX_IMPPT1 + m * 2
+        v = safe_float(row[v_idx]) if (v_idx is not None and v_idx < len(row)) else 0.0
+        i = safe_float(row[i_idx]) if (i_idx is not None and i_idx < len(row)) else 0.0
         mppt_v.append(v)
         mppts.append({
             "mppt": m + 1,
@@ -282,19 +522,23 @@ def extrair_dados(row, topologia):
         })
 
     # ---- Strings PV ----
-    # Percorre os MPPTs na ordem; para cada um, le quantas strings
-    # ele tem (vem da topologia do modelo). A string nao tem tensao
-    # propria: usa a do MPPT pai. O indice da corrente na row da API
-    # avanca sequencialmente, string apos string.
+    # Percorre os MPPTs na ordem; para cada um, le quantas strings ele tem
+    # (vem da topologia do modelo). A string nao tem tensao propria: usa a
+    # do MPPT pai. Quando ha cabecalho, a corrente de cada string vem da
+    # coluna localizada por titulo (pv_i_idx). Sem cabecalho, usa o bloco
+    # sequencial a partir de IDX_IPV1.
     strings = []
     string_num = 0          # numero global da string (1..num_string)
-    idx_corrente = 0        # deslocamento dentro do bloco IDX_IPV1
+    idx_corrente = 0        # deslocamento dentro do bloco IDX_IPV1 (fallback)
     for m in range(num_mppt):
         qtd = topologia["strings_por_mppt"].get(m + 1, 0)
         upv = mppt_v[m] if m < len(mppt_v) else 0.0
         for _ in range(qtd):
-            i_idx = IDX_IPV1 + idx_corrente
-            ipv = safe_float(row[i_idx]) if i_idx < len(row) else 0.0
+            if pv_i_idx is not None:
+                i_idx = pv_i_idx[string_num] if string_num < len(pv_i_idx) else None
+            else:
+                i_idx = IDX_IPV1 + idx_corrente
+            ipv = safe_float(row[i_idx]) if (i_idx is not None and i_idx < len(row)) else 0.0
             string_num += 1
             strings.append({
                 "string_num": string_num,
@@ -435,16 +679,17 @@ def main():
 
     print("=" * 60)
     print(f"COLETOR v2 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
+    print(f"  Aguardando {DELAY_SEGUNDOS}s para a Chint propagar o slot...")
 
-    # Slot alvo deste ciclo: o ultimo multiplo de 5 que ja deve estar publicado.
-    # Com o cron disparando 1 min apos a postagem da Chint (XX:01), truncar
-    # 'agora' para o multiplo de 5 anterior aponta exatamente para o slot
-    # recem-postado (XX:00). TODOS os inversores deste ciclo miram este mesmo
-    # slot — assim eliminamos a corrida em que um inversor ja propagou o slot
-    # novo e outro ainda nao, que antes deixava buracos no slot atual.
-    agora_utc = agora_br + timedelta(hours=3)   # BR (-3) -> UTC (convencao do banco)
-    slot_alvo = truncar_slot_5min(agora_utc)
-    print(f"  Slot alvo deste ciclo: {slot_alvo - timedelta(hours=3):%H:%M} BR")
+    # Espera antes de consultar a Chint, para que o slot atual ja tenha
+    # propagado para todos os inversores. O cron dispara no minuto exato
+    # (XX:00, XX:05, ...), mas a Chint demora alguns segundos para
+    # disponibilizar a leitura mais recente em todos os inversores.
+    time.sleep(DELAY_SEGUNDOS)
+
+    # Re-le 'agora' apos o sleep, para o log de pos-espera
+    agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
+    print(f"  Iniciando coleta as {agora_br:%H:%M:%S} (BR)")
 
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15)
     try:
@@ -479,6 +724,7 @@ def main():
         n_online  = 0
         n_pulado  = 0
         n_erro    = 0
+        cabecalho_logado = False
 
         for inv_id, nome, asset_id, modelo_id in inversores:
             topo = topologias.get(modelo_id)
@@ -488,49 +734,48 @@ def main():
                 continue
 
             try:
-                validas = buscar_leituras_validas(asset_id)
+                header, validas = buscar_leituras_validas(asset_id)
             except Exception as e:
                 print(f"  [{nome}] ERRO de API: {e}")
                 n_erro += 1
                 continue
+
+            # Diagnostico: imprime o cabecalho real UMA vez por execucao.
+            if LOG_CABECALHO and not cabecalho_logado:
+                cabecalho_logado = True
+                if header:
+                    print("  --- CABECALHO DA CHINT (titulos das colunas) ---")
+                    for j, titulo in enumerate(header):
+                        print(f"      [{j:3d}] {titulo}")
+                    cm = construir_colmap(header)
+                    print("  --- MAPEAMENTO RESOLVIDO (campo -> indice) ---")
+                    for campo in ("data", "pac_kw", "dyield_kwh", "tyield_kwh",
+                                  "freq_hz", "pdc_kw", "tmod_c", "tamb_c",
+                                  "iso_kohm"):
+                        idx = cm.get(campo)
+                        marca = "" if idx is not None else "  (NAO ACHOU -> fallback fixo)"
+                        ttl = header[idx] if idx is not None and idx < len(header) else "-"
+                        print(f"      {campo:12s} -> idx {str(idx):>4s}  [{ttl}]{marca}")
+                    vmap, imap, pvmap = mapear_mppts_strings(header, topo)
+                    print(f"      MPPT tensao  idx: {vmap}")
+                    print(f"      MPPT corrente idx: {imap}")
+                    print(f"      String corrente idx: {pvmap}")
+                    print("  ------------------------------------------------")
+                else:
+                    print("  AVISO: resposta da Chint SEM cabecalho de titulos; "
+                          "usando indices fixos (fallback IDX_*).")
 
             if not validas:
                 print(f"  [{nome}] sem leitura valida (Chint sem multiplo de 5)")
                 n_pulado += 1
                 continue
 
-            # Procura a leitura do SLOT ALVO (o mesmo para todos os inversores
-            # deste ciclo). Garante que todos gravem no mesmo timestamp e evita
-            # que, numa corrida de propagacao, uns gravem o slot novo e outros o
-            # anterior. Quem ainda nao tiver o slot e pulado e logado, em vez de
-            # regravar silenciosamente o slot anterior.
-            match = next(
-                ((ts, r) for ts, r in validas
-                 if truncar_slot_5min(ts) == slot_alvo),
-                None,
-            )
-            if match is None:
-                ts_br = slot_alvo - timedelta(hours=3)
-                print(f"  [{nome}] slot {ts_br:%H:%M} BR ainda nao publicado — pulando")
-                n_pulado += 1
-                continue
+            # Opcao A: pega a leitura mais recente multipla de 5
+            # (validas[0] e a mais recente; ja filtradas pelo fora-de-grid)
+            ts_chint, row = validas[0]
+            ts_grava = truncar_slot_5min(ts_chint)
 
-            ts_chint, row = match
-
-            # Se o slot foi publicado mas veio como snapshot PARCIAL
-            # (Running com Pac ~0), trata como "ainda nao consolidado":
-            # pula e loga, em vez de gravar um zero falso. O dashboard
-            # mantem a ultima leitura boa do inversor ate o slot consolidar.
-            if leitura_parcial(row):
-                ts_br = slot_alvo - timedelta(hours=3)
-                print(f"  [{nome}] slot {ts_br:%H:%M} BR parcial "
-                      f"(Running/Pac~0) — pulando ate consolidar")
-                n_pulado += 1
-                continue
-
-            ts_grava = slot_alvo
-
-            status, campos, mppts, strings = extrair_dados(row, topo)
+            status, campos, mppts, strings = extrair_dados(row, topo, header)
             gravar_leitura(cur, inv_id, ts_grava, status,
                            campos, mppts, strings)
             total_pac += campos["pac_kw"]
