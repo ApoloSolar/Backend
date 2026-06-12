@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1181 1181" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Apolo Solar">
+  <title>Apolo Solar</title>
+  <circle cx="292" cy="815" r="49.5" fill="#E7983A"></circle>
+  <circle cx="233" cy="654" r="53.5" fill="#E69233"></circle>
+  <circle cx="250" cy="478" r="56.5" fill="#E78C2F"></circle>
+  <circle cx="353" cy="327" r="60.5" fill="#E78025"></circle>
+  <circle cx="524" cy="233" r="63.5" fill="#E56E25"></circle>
+  <circle cx="724" cy="225" r="67" fill="#E57124"></circle>
+  <circle cx="892" cy="326" r="70.5" fill="#E56A25"></circle>
+  <g transform="translate(427 919) rotate(61.00)">
+    <path d="M -85.5 0 L -113.5 0" stroke="#E4A64A" stroke-width="3.5" stroke-linecap="round" fill="none"></path>
+    <path d="M -87.5 0 C -43.8 -27.0, 35.0 -25.6, 87.5 0 C 35.0 31.3, -43.8 33.0, -87.5 0 Z" fill="#E4A64A"></path>
+  </g>
+  <g transform="translate(619 977) rotate(25.10)">
+    <path d="M -85.5 0 L -113.5 0" stroke="#E5AC50" stroke-width="3.5" stroke-linecap="round" fill="none"></path>
+    <path d="M -87.5 0 C -43.8 -29.3, 35.0 -27.8, 87.5 0 C 35.0 34.0, -43.8 35.8, -87.5 0 Z" fill="#E5AC50"></path>
+  </g>
+  <g transform="translate(774 935) rotate(26.00)">
+    <path d="M -60.5 0 L -88.5 0" stroke="#E2BB62" stroke-width="3.5" stroke-linecap="round" fill="none"></path>
+    <path d="M -62.5 0 C -31.3 -20.3, 25.0 -19.2, 62.5 0 C 25.0 23.5, -31.3 24.8, -62.5 0 Z" fill="#E2BB62"></path>
+  </g>
+  <g transform="translate(891 848) rotate(-15.30)">
+    <path d="M -60.5 0 L -88.5 0" stroke="#E1C66E" stroke-width="3.5" stroke-linecap="round" fill="none"></path>
+    <path d="M -62.5 0 C -31.3 -18.9, 25.0 -18.0, 62.5 0 C 25.0 21.9, -31.3 23.1, -62.5 0 Z" fill="#E1C66E"></path>
+  </g>
+</svg>
