@@ -1,12 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  COLETOR v5 — APOLO SOLAR  (Railway / PostgreSQL)
+  COLETOR v6 — APOLO SOLAR  (Railway / PostgreSQL)
 ============================================================
-Le os inversores de uma usina na API da Chint e grava as
-leituras no banco PostgreSQL (schema v2).
+Le os inversores na API da Chint e grava as leituras no banco
+PostgreSQL (schema v2).
 
-COMO A v5 RESOLVE AS COLUNAS (a mudanca-chave):
+MUDANCA DA v6 (multi-usina num so coletor):
+  - Antes o coletor processava UMA usina por ciclo (USINA_SLUG
+    fixo em "pk"), entao Ibiracu nunca era coletada.
+  - Agora, por padrao, percorre TODAS as usinas cadastradas
+    num unico ciclo. Cada inversor e buscado na Chint pelo seu
+    proprio asset_id, entao um coletor so atende PK, Ibiracu e
+    qualquer usina futura.
+  - Continua possivel restringir a uma usina via env
+    (USINA_SLUG=pk), util para depuracao.
+
+COMO A v5/v6 RESOLVE AS COLUNAS (a mudanca-chave da v5):
   - Cada dado e pedido pelo TITULO da coluna ("Pac(W)",
     "Tmod(C)", "Umppt4(V)", "Ipv7(A)", "ISO(kOhm)"...), e nao
     por uma posicao fixa. Assim, se a ordem das colunas muda,
@@ -38,6 +48,7 @@ COMO RODA:
 
 CREDENCIAIS — variaveis de ambiente no Railway:
   DATABASE_URL, CHINT_TOKEN, CHINT_USER_ID
+  USINA_SLUG (opcional): "todas" (default) ou um slug especifico.
 
 Dependencia: psycopg. Ver requirements.txt.
 ============================================================
@@ -80,7 +91,15 @@ HEADERS = {
     "accept-language": "pt-PT",
 }
 
-USINA_SLUG     = "pk"
+# USINA_SLUG controla QUAIS usinas o coletor processa num ciclo:
+#   - "todas" (ou vazio)        -> coleta TODAS as usinas cadastradas.
+#                                  Modo recomendado: um coletor so atende
+#                                  PK, Ibiracu e qualquer usina futura.
+#   - um slug ("pk", "ibiracu") -> coleta apenas aquela usina (depuracao).
+# IMPORTANTE: se voce tinha USINA_SLUG=pk setado no Railway, troque para
+# "todas" (ou remova a variavel) para passar a coletar Ibiracu tambem.
+USINA_SLUG     = (os.environ.get("USINA_SLUG", "todas") or "todas").strip().lower()
+_COLETAR_TODAS = USINA_SLUG in ("", "todas", "all", "*")
 DELAY_SEGUNDOS = 20
 FUSO_BR        = timezone(timedelta(hours=-3))
 
@@ -491,7 +510,8 @@ def main():
     agora_br = datetime.now(FUSO_BR).replace(tzinfo=None)
 
     print("=" * 60)
-    print(f"COLETOR v5 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
+    print(f"COLETOR v6 APOLO SOLAR — agora {agora_br:%Y-%m-%d %H:%M:%S} (BR)")
+    print(f"  Usinas: {'TODAS' if _COLETAR_TODAS else USINA_SLUG}")
     print(f"  Aguardando {DELAY_SEGUNDOS}s para a Chint propagar o slot...")
     time.sleep(DELAY_SEGUNDOS)
 
@@ -508,20 +528,36 @@ def main():
             print("Rode o schema_v2.sql no banco primeiro.")
             sys.exit(1)
 
-        cur.execute(
-            """
-            SELECT i.id, i.nome, i.asset_id, i.modelo_id
-            FROM inversor i
-            JOIN usina u ON u.id = i.usina_id
-            WHERE u.slug = %s
-            ORDER BY i.idx
-            """,
-            (USINA_SLUG,),
-        )
+        # Seleciona os inversores a coletar. No modo "todas" (default), pega
+        # de TODAS as usinas num so ciclo — cada inversor e buscado na Chint
+        # pelo seu asset_id, entao funciona para qualquer usina. O slug da
+        # usina vem junto so para diferenciar no log PK x Ibiracu (ambos tem
+        # "Inversor 1", "Inversor 2"...).
+        if _COLETAR_TODAS:
+            cur.execute(
+                """
+                SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina
+                FROM inversor i
+                JOIN usina u ON u.id = i.usina_id
+                ORDER BY u.id, i.idx
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina
+                FROM inversor i
+                JOIN usina u ON u.id = i.usina_id
+                WHERE u.slug = %s
+                ORDER BY u.id, i.idx
+                """,
+                (USINA_SLUG,),
+            )
         inversores = cur.fetchall()
 
         if not inversores:
-            print(f"ERRO: nenhum inversor para a usina '{USINA_SLUG}'.")
+            alvo = "qualquer usina" if _COLETAR_TODAS else f"a usina '{USINA_SLUG}'"
+            print(f"ERRO: nenhum inversor para {alvo}.")
             print("Rode o schema_v2.sql no banco primeiro.")
             sys.exit(1)
 
@@ -530,22 +566,30 @@ def main():
         n_pulado  = 0
         n_erro    = 0
 
-        for inv_id, nome, asset_id, modelo_id in inversores:
+        for inv_id, nome, asset_id, modelo_id, usina in inversores:
+            etq = f"{usina}/{nome}"   # ex.: "ibiracu/Inversor 1"
+
             topo = topologias.get(modelo_id)
             if topo is None:
-                print(f"  [{nome}] ERRO: modelo {modelo_id} sem topologia.")
+                print(f"  [{etq}] ERRO: modelo {modelo_id} sem topologia.")
+                n_erro += 1
+                continue
+
+            if not asset_id:
+                print(f"  [{etq}] ERRO: sem asset_id cadastrado (nao da pra "
+                      f"buscar na Chint).")
                 n_erro += 1
                 continue
 
             try:
                 validas = buscar_leituras_validas(asset_id)
             except Exception as e:
-                print(f"  [{nome}] ERRO de API: {e}")
+                print(f"  [{etq}] ERRO de API: {e}")
                 n_erro += 1
                 continue
 
             if not validas:
-                print(f"  [{nome}] sem leitura valida (Chint sem multiplo de 5)")
+                print(f"  [{etq}] sem leitura valida (Chint sem multiplo de 5)")
                 n_pulado += 1
                 continue
 
@@ -554,14 +598,14 @@ def main():
 
             titulos, exato, diff = escolher_titulos(row)
             if diff > TOLERANCIA_COLUNAS:
-                print(f"  [{nome}] AVISO: {len(row)} colunas nao casa com nenhum "
+                print(f"  [{etq}] AVISO: {len(row)} colunas nao casa com nenhum "
                       f"layout conhecido (mais proximo: {len(titulos)}, diff "
                       f"{diff}). Pulado para nao gravar errado. Capture o "
                       f"cabecalho desse inversor e adicione em LAYOUTS_TITULOS.")
                 n_erro += 1
                 continue
             if not exato:
-                print(f"  [{nome}] AVISO: {len(row)} colunas; usando layout de "
+                print(f"  [{etq}] AVISO: {len(row)} colunas; usando layout de "
                       f"{len(titulos)} (diff {diff}).")
 
             status, campos, mppts, strings = extrair_dados(row, topo, titulos)
@@ -573,7 +617,7 @@ def main():
 
             ts_chint_br = ts_chint - timedelta(hours=3)
             ts_grava_br = ts_grava - timedelta(hours=3)
-            print(f"  [{nome}] {status} | {len(titulos)}col | "
+            print(f"  [{etq}] {status} | {len(titulos)}col | "
                   f"Chint {ts_chint_br:%H:%M:%S} BR -> slot {ts_grava_br:%H:%M} BR | "
                   f"Pac: {campos['pac_kw']:.2f} kW")
 
