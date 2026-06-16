@@ -103,6 +103,11 @@ _COLETAR_TODAS = USINA_SLUG in ("", "todas", "all", "*")
 DELAY_SEGUNDOS = 20
 FUSO_BR        = timezone(timedelta(hours=-3))
 
+# Limiar de "sol" para o tempo de insolacao: um slot de 5 min conta como
+# "com sol" quando a potencia TOTAL da usina passa deste valor (kW). 0.5 kW
+# corta ruido/standby sem perder geracao real. Ajuste se necessario.
+LIMIAR_SOL_KW = 0.5
+
 # A coluna do carimbo de hora ('Date') e a 0 em todos os layouts.
 IDX_DATE = 0
 
@@ -541,6 +546,7 @@ def resumir_dia(cur, agora_br_naive):
         "fim":     base_br + timedelta(days=1, hours=3),
         "luz_ini": base_br + timedelta(hours=6 + 3),   # 06:00 BR -> UTC
         "luz_fim": base_br + timedelta(hours=18 + 3),  # 18:00 BR -> UTC
+        "limiar":  LIMIAR_SOL_KW,
     }
 
     # ---- POR INVERSOR ----
@@ -633,6 +639,12 @@ def resumir_dia(cur, agora_br_naive):
             WHERE data_hora >= %(luz_ini)s AND data_hora < %(luz_fim)s
             GROUP BY usina_id
         ),
+        sol AS (         -- tempo de insolacao = slots com sol * 5min, em horas
+            SELECT usina_id, COUNT(*) * 5.0 / 60.0 AS insolacao_h
+            FROM pac_slot
+            WHERE pac_total > %(limiar)s
+            GROUP BY usina_id
+        ),
         energia AS (     -- energia = soma do MAX(dyield) por inversor
             SELECT usina_id, SUM(maxdy) AS energia_kwh FROM (
                 SELECT usina_id, inversor_id, MAX(dyield_kwh) AS maxdy
@@ -652,11 +664,12 @@ def resumir_dia(cur, agora_br_naive):
                COALESCE(m.pac_medio, 0),
                COALESCE(p.pico_kw, 0),
                p.pico_hora,
-               NULL,
+               COALESCE(so.insolacao_h, 0),
                COALESCE(n.n, 0),
                COALESCE(n.leituras, 0)
         FROM energia e
         LEFT JOIN media m ON m.usina_id = e.usina_id
+        LEFT JOIN sol so  ON so.usina_id = e.usina_id
         LEFT JOIN pico p  ON p.usina_id = e.usina_id
         LEFT JOIN ninv n  ON n.usina_id = e.usina_id
         ON CONFLICT (usina_id, data) DO UPDATE SET
@@ -664,9 +677,9 @@ def resumir_dia(cur, agora_br_naive):
             pac_medio_kw      = EXCLUDED.pac_medio_kw,
             pico_kw           = EXCLUDED.pico_kw,
             pico_hora         = EXCLUDED.pico_hora,
+            insolacao_h       = EXCLUDED.insolacao_h,
             inversores_no_dia = EXCLUDED.inversores_no_dia,
             leituras_totais   = EXCLUDED.leituras_totais
-            -- insolacao_h NAO e sobrescrita (preserva valor externo, se houver)
         """,
         params,
     )
