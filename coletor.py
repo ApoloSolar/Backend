@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  COLETOR v7 — APOLO SOLAR  (Railway / PostgreSQL)
+  COLETOR v6 — APOLO SOLAR  (Railway / PostgreSQL)
 ============================================================
 Le os inversores na API da Chint e grava as leituras no banco
 PostgreSQL (schema v2).
@@ -547,7 +547,7 @@ def resumir_dia(cur, agora_br_naive):
     cur.execute(
         """
         WITH ld AS (
-            SELECT l.inversor_id, l.data_hora, l.pac_kw, l.dyield_kwh
+            SELECT l.inversor_id, l.data_hora, l.pac_kw, l.dyield_kwh, l.tmod_c
             FROM leitura l
             WHERE l.data_hora >= %(ini)s AND l.data_hora < %(fim)s
         ),
@@ -558,7 +558,9 @@ def resumir_dia(cur, agora_br_naive):
             GROUP BY i.usina_id
         ),
         energia AS (
-            SELECT inversor_id, MAX(dyield_kwh) AS energia_kwh
+            SELECT inversor_id, MAX(dyield_kwh) AS energia_kwh,
+                   COUNT(*) AS leituras,
+                   MAX(tmod_c) AS tmod_max, AVG(tmod_c) AS tmod_med
             FROM ld GROUP BY inversor_id
         ),
         pico AS (
@@ -566,12 +568,6 @@ def resumir_dia(cur, agora_br_naive):
                    pac_kw AS pico_kw,
                    (data_hora - interval '3 hours')::time AS pico_hora
             FROM ld ORDER BY inversor_id, pac_kw DESC, data_hora
-        ),
-        media AS (
-            SELECT inversor_id, AVG(pac_kw) AS pac_medio
-            FROM ld
-            WHERE data_hora >= %(luz_ini)s AND data_hora < %(luz_fim)s
-            GROUP BY inversor_id
         ),
         gerando AS (
             SELECT inversor_id, COUNT(DISTINCT data_hora) AS n
@@ -582,28 +578,31 @@ def resumir_dia(cur, agora_br_naive):
         )
         INSERT INTO resumo_dia_inversor
             (inversor_id, data, energia_kwh, pico_kw, pico_hora,
-             disponibilidade, pac_medio_6_18_kw)
+             tmod_max, tmod_med, disponibilidade, leituras)
         SELECT e.inversor_id, %(dia)s::date,
                COALESCE(e.energia_kwh, 0),
                COALESCE(p.pico_kw, 0),
                p.pico_hora,
+               e.tmod_max,
+               e.tmod_med,
                CASE WHEN COALESCE(sl.n_slots, 0) > 0
                     THEN LEAST(100.0,
                          COALESCE(g.n, 0)::numeric / sl.n_slots * 100)
                     ELSE 0 END,
-               COALESCE(m.pac_medio, 0)
+               COALESCE(e.leituras, 0)
         FROM energia e
         JOIN inversor i      ON i.id = e.inversor_id
         LEFT JOIN pico p     ON p.inversor_id = e.inversor_id
-        LEFT JOIN media m    ON m.inversor_id = e.inversor_id
         LEFT JOIN gerando g  ON g.inversor_id = e.inversor_id
         LEFT JOIN slots_luz sl ON sl.usina_id = i.usina_id
         ON CONFLICT (inversor_id, data) DO UPDATE SET
-            energia_kwh       = EXCLUDED.energia_kwh,
-            pico_kw           = EXCLUDED.pico_kw,
-            pico_hora         = EXCLUDED.pico_hora,
-            disponibilidade   = EXCLUDED.disponibilidade,
-            pac_medio_6_18_kw = EXCLUDED.pac_medio_6_18_kw
+            energia_kwh     = EXCLUDED.energia_kwh,
+            pico_kw         = EXCLUDED.pico_kw,
+            pico_hora       = EXCLUDED.pico_hora,
+            tmod_max        = EXCLUDED.tmod_max,
+            tmod_med        = EXCLUDED.tmod_med,
+            disponibilidade = EXCLUDED.disponibilidade,
+            leituras        = EXCLUDED.leituras
         """,
         params,
     )
@@ -641,19 +640,21 @@ def resumir_dia(cur, agora_br_naive):
             ) s GROUP BY usina_id
         ),
         ninv AS (
-            SELECT usina_id, COUNT(DISTINCT inversor_id) AS n
+            SELECT usina_id, COUNT(DISTINCT inversor_id) AS n,
+                   COUNT(*) AS leituras
             FROM ld GROUP BY usina_id
         )
         INSERT INTO resumo_dia
             (usina_id, data, energia_kwh, pac_medio_kw, pico_kw,
-             pico_hora, insolacao_h, inversores_no_dia)
+             pico_hora, insolacao_h, inversores_no_dia, leituras_totais)
         SELECT e.usina_id, %(dia)s::date,
                COALESCE(e.energia_kwh, 0),
                COALESCE(m.pac_medio, 0),
                COALESCE(p.pico_kw, 0),
                p.pico_hora,
                NULL,
-               COALESCE(n.n, 0)
+               COALESCE(n.n, 0),
+               COALESCE(n.leituras, 0)
         FROM energia e
         LEFT JOIN media m ON m.usina_id = e.usina_id
         LEFT JOIN pico p  ON p.usina_id = e.usina_id
@@ -663,7 +664,8 @@ def resumir_dia(cur, agora_br_naive):
             pac_medio_kw      = EXCLUDED.pac_medio_kw,
             pico_kw           = EXCLUDED.pico_kw,
             pico_hora         = EXCLUDED.pico_hora,
-            inversores_no_dia = EXCLUDED.inversores_no_dia
+            inversores_no_dia = EXCLUDED.inversores_no_dia,
+            leituras_totais   = EXCLUDED.leituras_totais
             -- insolacao_h NAO e sobrescrita (preserva valor externo, se houver)
         """,
         params,
