@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  COLETOR v6 — APOLO SOLAR  (Railway / PostgreSQL)
+  COLETOR v7 — APOLO SOLAR  (Railway / PostgreSQL)
 ============================================================
 Le os inversores na API da Chint e grava as leituras no banco
 PostgreSQL (schema v2).
@@ -503,6 +503,174 @@ def gravar_leitura(cur, inversor_id, ts, status, campos, mppts, strings):
 
 
 # ============================================================
+# RESUMO DO DIA — alimenta resumo_dia / resumo_dia_inversor
+# ------------------------------------------------------------
+# Recalcula o resumo do DIA DE HOJE (por usina) a partir das
+# leituras cruas e faz UPSERT. Roda a cada ciclo (5 em 5 min),
+# entao os modos MENSAL e ANUAL do dashboard ficam ao vivo: o
+# valor do dia em curso atualiza junto com a coleta.
+#
+# Como nada e recalculado para dias passados (so hoje), o custo
+# e baixo (algumas milhares de linhas, resumidas NO banco).
+#
+# FUSOS: leitura.data_hora e gravado em UTC (naive). O Brasil e
+# UTC-3, entao:
+#   - 00:00 BR  ->  03:00 UTC
+#   - 06:00 BR  ->  09:00 UTC   (inicio da janela de luz)
+#   - 18:00 BR  ->  21:00 UTC   (fim da janela de luz)
+# A hora do pico e devolvida ja em BR ((data_hora - 3h)::time).
+#
+# DEFINICOES (espelham o endpoint /dia da API):
+#   energia_kwh = soma do MAX(dyield_kwh) de cada inversor no dia
+#   pico_kw     = maior potencia INSTANTANEA (soma dos inversores)
+#   pac_medio   = media da potencia na janela 06-18h BR
+#   disponibilidade = slots gerando / slots com leitura (06-18h)
+#   insolacao_h = NULL aqui (nao ha sensor de irradiancia; se um
+#                 processo externo preencher, este UPSERT NAO
+#                 sobrescreve a insolacao existente).
+# ============================================================
+
+def resumir_dia(cur, agora_br_naive):
+    """UPSERT do resumo do dia de hoje, por usina, em resumo_dia
+    e resumo_dia_inversor. Le as leituras cruas e resume no banco."""
+    dia = agora_br_naive.date()
+    base_br = datetime(dia.year, dia.month, dia.day)   # 00:00 BR (naive)
+    params = {
+        "dia":     dia,
+        "ini":     base_br + timedelta(hours=3),       # 00:00 BR -> UTC
+        "fim":     base_br + timedelta(days=1, hours=3),
+        "luz_ini": base_br + timedelta(hours=6 + 3),   # 06:00 BR -> UTC
+        "luz_fim": base_br + timedelta(hours=18 + 3),  # 18:00 BR -> UTC
+    }
+
+    # ---- POR INVERSOR ----
+    cur.execute(
+        """
+        WITH ld AS (
+            SELECT l.inversor_id, l.data_hora, l.pac_kw, l.dyield_kwh
+            FROM leitura l
+            WHERE l.data_hora >= %(ini)s AND l.data_hora < %(fim)s
+        ),
+        slots_luz AS (   -- slots (por usina) com qualquer leitura na luz
+            SELECT i.usina_id, COUNT(DISTINCT ld.data_hora) AS n_slots
+            FROM ld JOIN inversor i ON i.id = ld.inversor_id
+            WHERE ld.data_hora >= %(luz_ini)s AND ld.data_hora < %(luz_fim)s
+            GROUP BY i.usina_id
+        ),
+        energia AS (
+            SELECT inversor_id, MAX(dyield_kwh) AS energia_kwh
+            FROM ld GROUP BY inversor_id
+        ),
+        pico AS (
+            SELECT DISTINCT ON (inversor_id) inversor_id,
+                   pac_kw AS pico_kw,
+                   (data_hora - interval '3 hours')::time AS pico_hora
+            FROM ld ORDER BY inversor_id, pac_kw DESC, data_hora
+        ),
+        media AS (
+            SELECT inversor_id, AVG(pac_kw) AS pac_medio
+            FROM ld
+            WHERE data_hora >= %(luz_ini)s AND data_hora < %(luz_fim)s
+            GROUP BY inversor_id
+        ),
+        gerando AS (
+            SELECT inversor_id, COUNT(DISTINCT data_hora) AS n
+            FROM ld
+            WHERE data_hora >= %(luz_ini)s AND data_hora < %(luz_fim)s
+              AND pac_kw > 0.05
+            GROUP BY inversor_id
+        )
+        INSERT INTO resumo_dia_inversor
+            (inversor_id, data, energia_kwh, pico_kw, pico_hora,
+             disponibilidade, pac_medio_6_18_kw)
+        SELECT e.inversor_id, %(dia)s::date,
+               COALESCE(e.energia_kwh, 0),
+               COALESCE(p.pico_kw, 0),
+               p.pico_hora,
+               CASE WHEN COALESCE(sl.n_slots, 0) > 0
+                    THEN LEAST(100.0,
+                         COALESCE(g.n, 0)::numeric / sl.n_slots * 100)
+                    ELSE 0 END,
+               COALESCE(m.pac_medio, 0)
+        FROM energia e
+        JOIN inversor i      ON i.id = e.inversor_id
+        LEFT JOIN pico p     ON p.inversor_id = e.inversor_id
+        LEFT JOIN media m    ON m.inversor_id = e.inversor_id
+        LEFT JOIN gerando g  ON g.inversor_id = e.inversor_id
+        LEFT JOIN slots_luz sl ON sl.usina_id = i.usina_id
+        ON CONFLICT (inversor_id, data) DO UPDATE SET
+            energia_kwh       = EXCLUDED.energia_kwh,
+            pico_kw           = EXCLUDED.pico_kw,
+            pico_hora         = EXCLUDED.pico_hora,
+            disponibilidade   = EXCLUDED.disponibilidade,
+            pac_medio_6_18_kw = EXCLUDED.pac_medio_6_18_kw
+        """,
+        params,
+    )
+
+    # ---- POR USINA (planta) ----
+    cur.execute(
+        """
+        WITH ld AS (
+            SELECT i.usina_id, l.inversor_id, l.data_hora,
+                   l.pac_kw, l.dyield_kwh
+            FROM leitura l
+            JOIN inversor i ON i.id = l.inversor_id
+            WHERE l.data_hora >= %(ini)s AND l.data_hora < %(fim)s
+        ),
+        pac_slot AS (    -- potencia total da usina por instante
+            SELECT usina_id, data_hora, SUM(pac_kw) AS pac_total
+            FROM ld GROUP BY usina_id, data_hora
+        ),
+        pico AS (        -- maior potencia instantanea + hora (BR)
+            SELECT DISTINCT ON (usina_id) usina_id,
+                   pac_total AS pico_kw,
+                   (data_hora - interval '3 hours')::time AS pico_hora
+            FROM pac_slot ORDER BY usina_id, pac_total DESC, data_hora
+        ),
+        media AS (       -- pac media da usina na janela 06-18h
+            SELECT usina_id, AVG(pac_total) AS pac_medio
+            FROM pac_slot
+            WHERE data_hora >= %(luz_ini)s AND data_hora < %(luz_fim)s
+            GROUP BY usina_id
+        ),
+        energia AS (     -- energia = soma do MAX(dyield) por inversor
+            SELECT usina_id, SUM(maxdy) AS energia_kwh FROM (
+                SELECT usina_id, inversor_id, MAX(dyield_kwh) AS maxdy
+                FROM ld GROUP BY usina_id, inversor_id
+            ) s GROUP BY usina_id
+        ),
+        ninv AS (
+            SELECT usina_id, COUNT(DISTINCT inversor_id) AS n
+            FROM ld GROUP BY usina_id
+        )
+        INSERT INTO resumo_dia
+            (usina_id, data, energia_kwh, pac_medio_kw, pico_kw,
+             pico_hora, insolacao_h, inversores_no_dia)
+        SELECT e.usina_id, %(dia)s::date,
+               COALESCE(e.energia_kwh, 0),
+               COALESCE(m.pac_medio, 0),
+               COALESCE(p.pico_kw, 0),
+               p.pico_hora,
+               NULL,
+               COALESCE(n.n, 0)
+        FROM energia e
+        LEFT JOIN media m ON m.usina_id = e.usina_id
+        LEFT JOIN pico p  ON p.usina_id = e.usina_id
+        LEFT JOIN ninv n  ON n.usina_id = e.usina_id
+        ON CONFLICT (usina_id, data) DO UPDATE SET
+            energia_kwh       = EXCLUDED.energia_kwh,
+            pac_medio_kw      = EXCLUDED.pac_medio_kw,
+            pico_kw           = EXCLUDED.pico_kw,
+            pico_hora         = EXCLUDED.pico_hora,
+            inversores_no_dia = EXCLUDED.inversores_no_dia
+            -- insolacao_h NAO e sobrescrita (preserva valor externo, se houver)
+        """,
+        params,
+    )
+
+
+# ============================================================
 # CICLO DE COLETA — roda UMA vez
 # ============================================================
 
@@ -621,7 +789,18 @@ def main():
                   f"Chint {ts_chint_br:%H:%M:%S} BR -> slot {ts_grava_br:%H:%M} BR | "
                   f"Pac: {campos['pac_kw']:.2f} kW")
 
-        conn.commit()
+        conn.commit()   # leituras cruas ja estao salvas
+
+        # Resumo do dia (alimenta mensal/anual ao vivo). Vai num commit
+        # SEPARADO: se falhar, as leituras acima permanecem gravadas.
+        try:
+            resumir_dia(cur, agora_br)
+            conn.commit()
+            print("  Resumo do dia atualizado (resumo_dia / por inversor).")
+        except Exception as e:
+            conn.rollback()
+            print(f"  AVISO: resumo do dia falhou (leituras OK): {e}")
+
         print("-" * 60)
         print(f"  Potencia total: {total_pac:.2f} kW | "
               f"Online: {n_online}/{len(inversores)} | "
