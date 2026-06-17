@@ -108,6 +108,10 @@ FUSO_BR        = timezone(timedelta(hours=-3))
 # corta ruido/standby sem perder geracao real. Ajuste se necessario.
 LIMIAR_SOL_KW = 0.5
 
+# Janela retroativa (em dias) para buscar alarmes da Chint a cada ciclo.
+# O ON CONFLICT (id) deduplica, entao reconsultar a mesma janela e barato.
+DIAS_ALARMES = 3
+
 # A coluna do carimbo de hora ('Date') e a 0 em todos os layouts.
 IDX_DATE = 0
 
@@ -686,6 +690,172 @@ def resumir_dia(cur, agora_br_naive):
 
 
 # ============================================================
+# ALARMES — Chint (event/list) + falhas de leitura do coletor
+# ------------------------------------------------------------
+# Grava na tabela 'alarmes', unificando duas origens:
+#   origem='chint'   -> alarmes reais da Chint (/api/toolbox/event/list).
+#                       Chave = o id da Chint (dedup via ON CONFLICT).
+#   origem='coletor' -> falhas de leitura (erro de API ou inversor sem
+#                       leitura no slot) = possivel queda de internet na
+#                       usina. Modelado como EPISODIO: abre quando falha,
+#                       fecha (fim_em) quando o inversor volta a ler.
+# ============================================================
+
+def _parse_iso_utc(s):
+    """'2026-06-16T09:17:15.000+00:00' -> datetime naive em UTC."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def buscar_alarmes_chint(site_id, begin, end, limit=100):
+    """Busca todos os alarmes de uma usina no intervalo [begin, end]
+    (YYYY-MM-DD), paginando. Retorna a lista de registros crus."""
+    todos = []
+    page = 1
+    while True:
+        url = (
+            f"{BASE}/api/toolbox/event/list"
+            f"?key=&siteId={site_id}&begin={begin}&end={end}"
+            f"&errorType=&checked=&errorReasonType=1&assetId="
+            f"&page={page}&limit={limit}&lifetime=false"
+        )
+        req  = Request(url, headers=HEADERS)
+        resp = urlopen(req, timeout=20)
+        data = json.loads(resp.read())
+        if data.get("code") != "0":
+            raise ValueError(f"event/list retornou erro: {data.get('msg')}")
+        lote = data.get("data") or []
+        todos.extend(lote)
+        total = data.get("count") or 0
+        if len(lote) < limit or len(todos) >= total or page >= 50:
+            break
+        page += 1
+    return todos
+
+
+def _gravar_alarmes_chint(cur, usina_id, registros, mapa_sn):
+    """UPSERT dos alarmes da Chint. mapa_sn: deviceSn -> inversor_id."""
+    for rec in registros:
+        aid = rec.get("id")
+        if not aid:
+            continue
+        sn     = rec.get("deviceSn") or rec.get("assetAlias")
+        inv_id = mapa_sn.get(sn)
+        ocorr  = _parse_iso_utc(rec.get("actionDate"))
+        descr  = (rec.get("errorDescriptron") or rec.get("content")
+                  or rec.get("description"))
+        cur.execute(
+            """
+            INSERT INTO alarmes
+                (id, origem, usina_id, inversor_id, device_sn, gateway_id,
+                 modbus_id, site_name, ocorrido_em, inicio_em, fim_em,
+                 action_type, error_type, codigo, descricao, model,
+                 code_count, checked, dados_brutos)
+            VALUES (%s,'chint',%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s,
+                    %s,%s,%s::jsonb)
+            ON CONFLICT (id) DO UPDATE SET
+                checked       = EXCLUDED.checked,
+                code_count    = EXCLUDED.code_count,
+                descricao     = EXCLUDED.descricao,
+                dados_brutos  = EXCLUDED.dados_brutos,
+                inversor_id   = COALESCE(alarmes.inversor_id, EXCLUDED.inversor_id),
+                atualizado_em = now()
+            """,
+            (
+                aid, usina_id, inv_id, sn, rec.get("gatewayId"),
+                rec.get("modbusId"), rec.get("siteName"), ocorr, ocorr,
+                rec.get("actionType"), rec.get("errorType"),
+                rec.get("description"), descr, rec.get("model"),
+                rec.get("codeCount"), bool(rec.get("checked")),
+                json.dumps(rec, ensure_ascii=False),
+            ),
+        )
+
+
+def _registrar_falhas_coletor(cur, inv_falha, inv_ok, slot_utc):
+    """Episodios de falha de leitura. inv_falha: lista (inv_id, codigo,
+    descricao). inv_ok: set de inversores que LERAM neste ciclo."""
+    for inv_id, codigo, descricao in inv_falha:
+        cur.execute(
+            """
+            SELECT id FROM alarmes
+            WHERE origem='coletor' AND inversor_id=%s AND fim_em IS NULL
+            ORDER BY inicio_em DESC LIMIT 1
+            """,
+            (inv_id,),
+        )
+        aberto = cur.fetchone()
+        if aberto:   # ja ha episodio em aberto -> estende
+            cur.execute(
+                """
+                UPDATE alarmes SET ocorrido_em=%s, ocorrencias=ocorrencias+1,
+                       codigo=%s, descricao=%s, atualizado_em=now()
+                WHERE id=%s
+                """,
+                (slot_utc, codigo, descricao, aberto[0]),
+            )
+        else:        # abre episodio novo
+            novo_id = f"coletor:{inv_id}:{slot_utc:%Y%m%dT%H%M}"
+            cur.execute(
+                """
+                INSERT INTO alarmes
+                    (id, origem, inversor_id, usina_id, ocorrido_em, inicio_em,
+                     fim_em, error_type, codigo, descricao, ocorrencias)
+                SELECT %s,'coletor',%s,i.usina_id,%s,%s,NULL,'LEITURA',%s,%s,1
+                FROM inversor i WHERE i.id=%s
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (novo_id, inv_id, slot_utc, slot_utc, codigo, descricao, inv_id),
+            )
+
+    # Fecha episodios dos inversores que voltaram a ler
+    if inv_ok:
+        cur.execute(
+            """
+            UPDATE alarmes SET fim_em=%s, atualizado_em=now()
+            WHERE origem='coletor' AND fim_em IS NULL
+              AND inversor_id = ANY(%s)
+            """,
+            (slot_utc, list(inv_ok)),
+        )
+
+
+def coletar_alarmes(cur, inv_falha, inv_ok, slot_utc, agora_br):
+    """Roda ao fim do ciclo: episodios de falha (sempre) + alarmes da
+    Chint (para cada usina que tiver site_id)."""
+    # 1) falhas de leitura — nao dependem da Chint
+    _registrar_falhas_coletor(cur, inv_falha, inv_ok, slot_utc)
+
+    # 2) alarmes da Chint, por usina com site_id
+    cur.execute("SELECT id, slug, site_id FROM usina "
+                "WHERE site_id IS NOT NULL AND site_id <> ''")
+    usinas = cur.fetchall()
+    if not usinas:
+        return
+
+    # mapa deviceSn -> inversor_id (melhor esforco, via asset_id)
+    cur.execute("SELECT id, asset_id FROM inversor WHERE asset_id IS NOT NULL")
+    mapa_sn = {a: i for (i, a) in cur.fetchall()}
+
+    fim   = agora_br.date()
+    begin = fim - timedelta(days=DIAS_ALARMES)
+    for usina_id, slug, site_id in usinas:
+        try:
+            regs = buscar_alarmes_chint(site_id, begin.isoformat(), fim.isoformat())
+            _gravar_alarmes_chint(cur, usina_id, regs, mapa_sn)
+            print(f"  Alarmes Chint [{slug}]: {len(regs)} registro(s).")
+        except Exception as e:
+            print(f"  AVISO: alarmes Chint [{slug}] falhou: {e}")
+
+
+# ============================================================
 # CICLO DE COLETA — roda UMA vez
 # ============================================================
 
@@ -748,6 +918,8 @@ def main():
         n_online  = 0
         n_pulado  = 0
         n_erro    = 0
+        inv_ok    = set()   # inversores que LERAM neste ciclo
+        inv_falha = []      # (inv_id, codigo, descricao) p/ alarme de leitura
 
         for inv_id, nome, asset_id, modelo_id, usina in inversores:
             etq = f"{usina}/{nome}"   # ex.: "ibiracu/Inversor 1"
@@ -769,11 +941,15 @@ def main():
             except Exception as e:
                 print(f"  [{etq}] ERRO de API: {e}")
                 n_erro += 1
+                # falha de conexao com a Chint -> possivel queda de internet
+                inv_falha.append((inv_id, "ERRO_API", str(e)[:200]))
                 continue
 
             if not validas:
                 print(f"  [{etq}] sem leitura valida (Chint sem multiplo de 5)")
                 n_pulado += 1
+                inv_falha.append((inv_id, "SEM_LEITURA",
+                                  "Chint sem leitura no slot"))
                 continue
 
             ts_chint, row = validas[0]
@@ -795,6 +971,7 @@ def main():
             gravar_leitura(cur, inv_id, ts_grava, status,
                            campos, mppts, strings)
             total_pac += campos["pac_kw"]
+            inv_ok.add(inv_id)   # leu com sucesso -> fecha episodio de falha
             if status == "ONLINE":
                 n_online += 1
 
@@ -815,6 +992,16 @@ def main():
         except Exception as e:
             conn.rollback()
             print(f"  AVISO: resumo do dia falhou (leituras OK): {e}")
+
+        # Alarmes (Chint + falhas de leitura). Commit SEPARADO tambem.
+        try:
+            slot_utc = truncar_slot_5min(agora_br + timedelta(hours=3))  # BR->UTC
+            coletar_alarmes(cur, inv_falha, inv_ok, slot_utc, agora_br)
+            conn.commit()
+            print("  Alarmes atualizados (Chint + falhas de leitura).")
+        except Exception as e:
+            conn.rollback()
+            print(f"  AVISO: alarmes falharam (leituras/resumo OK): {e}")
 
         print("-" * 60)
         print(f"  Potencia total: {total_pac:.2f} kW | "
