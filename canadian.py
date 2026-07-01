@@ -24,6 +24,7 @@ Variaveis de ambiente (Railway):
 
 import os
 import json
+import time
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 from datetime import datetime
@@ -31,6 +32,10 @@ from datetime import datetime
 SEP_BASE       = os.environ.get("CANADIAN_BASE", "https://sep-api.csisolar.com")
 SEP_APP_ID     = os.environ.get("CANADIAN_APP_ID", "")
 SEP_APP_SECRET = os.environ.get("CANADIAN_APP_SECRET", "")
+
+# Erros TRANSITORIOS do backend da Canadian: nao sao falha do request,
+# valem retry. 602 = "redis error" (cache deles caiu momentaneamente).
+CODIGOS_TRANSITORIOS = {602}
 
 # token reaproveitado durante UMA execucao do coletor
 _token_cache = {"token": None}
@@ -85,45 +90,74 @@ def obter_token(forcar=False):
 # ------------------------------------------------------------
 # Leitura em tempo real
 # ------------------------------------------------------------
-def buscar_realtime(serial_sn):
-    """Busca o tempo real de 1 inversor.
+def buscar_realtime(serial_sn, tentativas=3, backoff=3):
+    """Busca o tempo real de 1 inversor, COM RETRY em erros transitorios
+    do servidor da Canadian (ex.: code 602 'redis error', 5xx).
     Retorna (ts_utc_naive, dados_dict, online_bool).
       - dados_dict: {fieldCode: valor}
       - ts_utc_naive: lastReportTime (a API entrega em UTC)
-    Levanta excecao em erro de API (o coletor trata como ERRO_API)."""
-    token = obter_token()
-    b = _get("/open-api/device/data", {"deviceSnStr": serial_sn}, token)
+    Levanta excecao so depois de esgotar as tentativas, ou em erro
+    definitivo (parametro invalido etc.). O coletor trata como ERRO_API."""
+    ultimo_erro = None
 
-    # token expirado -> reautentica uma vez
-    msg = (b.get("msg") or "").lower()
-    if b.get("code") in (401, 508) or "token" in msg:
-        token = obter_token(forcar=True)
-        b = _get("/open-api/device/data", {"deviceSnStr": serial_sn}, token)
+    for tentativa in range(1, tentativas + 1):
+        # na ultima tentativa, forca um token novo (caso o cache/token
+        # esteja preso num no problematico do backend deles)
+        token = obter_token(forcar=(tentativa == tentativas))
 
-    if b.get("code") not in (0, 200):
-        raise ValueError(f"device/data Canadian erro: code={b.get('code')} msg={b.get('msg')}")
+        try:
+            b = _get("/open-api/device/data", {"deviceSnStr": serial_sn}, token)
+        except Exception as e:
+            ultimo_erro = f"conexao: {e}"
+            time.sleep(backoff)
+            continue
 
-    lst = b.get("data") or []
-    if not lst:
-        return None, {}, False
-    dev = lst[0]
+        code = b.get("code")
+        msg  = (b.get("msg") or "")
 
-    dados = {}
-    for f in dev.get("realData", []):
-        dados[f.get("fieldCode")] = f.get("data")
+        # token expirado/invalido -> reautentica e tenta de novo
+        if code in (401, 508) or "token" in msg.lower():
+            obter_token(forcar=True)
+            ultimo_erro = f"token: code={code} msg={msg}"
+            continue
 
-    ts = None
-    lrt = dev.get("lastReportTime")
-    if lrt:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-            try:
-                ts = datetime.strptime(str(lrt).strip(), fmt)
-                break
-            except (ValueError, TypeError):
-                pass
+        # sucesso
+        if code in (0, 200):
+            lst = b.get("data") or []
+            if not lst:
+                return None, {}, False
+            dev = lst[0]
 
-    online = dev.get("status") == 1
-    return ts, dados, online
+            dados = {}
+            for f in dev.get("realData", []):
+                dados[f.get("fieldCode")] = f.get("data")
+
+            ts = None
+            lrt = dev.get("lastReportTime")
+            if lrt:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                    try:
+                        ts = datetime.strptime(str(lrt).strip(), fmt)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+            online = dev.get("status") == 1
+            return ts, dados, online
+
+        # erro TRANSITORIO do servidor (redis 602, 5xx) -> espera e repete
+        if code in CODIGOS_TRANSITORIOS or (isinstance(code, int) and code >= 500):
+            ultimo_erro = f"transitorio: code={code} msg={msg}"
+            print(f"    [canadian] {serial_sn}: {ultimo_erro} "
+                  f"(tentativa {tentativa}/{tentativas}) — repetindo...")
+            time.sleep(backoff)
+            continue
+
+        # erro DEFINITIVO (ex.: parametro invalido) -> nao adianta repetir
+        raise ValueError(f"device/data Canadian erro: code={code} msg={msg}")
+
+    raise ValueError(f"device/data Canadian falhou apos {tentativas} tentativas "
+                     f"({ultimo_erro})")
 
 
 # ------------------------------------------------------------
