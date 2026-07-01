@@ -16,6 +16,22 @@ MUDANCA DA v6 (multi-usina num so coletor):
   - Continua possivel restringir a uma usina via env
     (USINA_SLUG=pk), util para depuracao.
 
+MUDANCA DA v7 (multi-marca num so coletor):
+  - O laço continua UNICO. Cada inversor tem um campo 'fonte'
+    ('chint' | 'canadian') e o laço ROTEIA por ele.
+  - 'chint'    -> fluxo original (asset_id + deviceDataPageList
+                  + layouts/titulos), INALTERADO.
+  - 'canadian' -> adaptador Smart Energy (CSI Solar), no modulo
+                  canadian.py: autentica, le /open-api/device/data
+                  pelo serial_sn e traduz para o MESMO
+                  (status, campos, mppts, strings).
+  - O nucleo compartilhado (carregar_topologias, gravar_leitura,
+    resumir_dia, episodios de falha de leitura) e agnostico de
+    marca e nao muda. Cada marca so precisa devolver o mesmo
+    formato de leitura.
+  - Credenciais Canadian por env: CANADIAN_APP_ID,
+    CANADIAN_APP_SECRET, CANADIAN_BASE (opcional).
+
 COMO A v5/v6 RESOLVE AS COLUNAS (a mudanca-chave da v5):
   - Cada dado e pedido pelo TITULO da coluna ("Pac(W)",
     "Tmod(C)", "Umppt4(V)", "Ipv7(A)", "ISO(kOhm)"...), e nao
@@ -63,6 +79,11 @@ import sys
 import time
 
 import psycopg
+
+# Adaptador da plataforma Smart Energy (CSI Solar / Canadian). Roda DENTRO
+# deste mesmo coletor/cron: fala com a API da Canadian e traduz a resposta
+# para o MESMO (status, campos, mppts, strings) que a gravar_leitura() usa.
+import canadian
 
 
 # ============================================================
@@ -886,10 +907,15 @@ def main():
         # pelo seu asset_id, entao funciona para qualquer usina. O slug da
         # usina vem junto so para diferenciar no log PK x Ibiracu (ambos tem
         # "Inversor 1", "Inversor 2"...).
+        # Seleciona inversores de TODAS as fontes (nao filtra por 'fonte' no
+        # SQL): o laço roteia por i.fonte. i.serial_sn e usado pelo ramo
+        # Canadian (identifica o dispositivo na API Smart Energy); i.asset_id
+        # continua sendo o identificador do ramo Chint.
         if _COLETAR_TODAS:
             cur.execute(
                 """
-                SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina
+                SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina,
+                       i.fonte, i.serial_sn
                 FROM inversor i
                 JOIN usina u ON u.id = i.usina_id
                 ORDER BY u.id, i.idx
@@ -898,7 +924,8 @@ def main():
         else:
             cur.execute(
                 """
-                SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina
+                SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina,
+                       i.fonte, i.serial_sn
                 FROM inversor i
                 JOIN usina u ON u.id = i.usina_id
                 WHERE u.slug = %s
@@ -921,7 +948,7 @@ def main():
         inv_ok    = set()   # inversores que LERAM neste ciclo
         inv_falha = []      # (inv_id, codigo, descricao) p/ alarme de leitura
 
-        for inv_id, nome, asset_id, modelo_id, usina in inversores:
+        for inv_id, nome, asset_id, modelo_id, usina, fonte, serial_sn in inversores:
             etq = f"{usina}/{nome}"   # ex.: "ibiracu/Inversor 1"
 
             topo = topologias.get(modelo_id)
@@ -930,6 +957,60 @@ def main():
                 n_erro += 1
                 continue
 
+            # ---------------------------------------------------------------
+            # ROTEAMENTO POR FONTE — ramo Canadian (Smart Energy / CSI Solar).
+            # Mesma semantica de contadores e falhas da Chint; ao final,
+            # 'continue' (o resto do laço e exclusivo da Chint).
+            # ---------------------------------------------------------------
+            if (fonte or "chint") == "canadian":
+                if not serial_sn:
+                    print(f"  [{etq}] ERRO: sem serial_sn cadastrado (nao da "
+                          f"pra buscar na Canadian).")
+                    n_erro += 1
+                    continue
+
+                try:
+                    ts_utc, dados, online = canadian.buscar_realtime(serial_sn)
+                except Exception as e:
+                    print(f"  [{etq}] ERRO de API (Canadian): {e}")
+                    n_erro += 1
+                    # falha de conexao/API -> possivel queda de internet
+                    inv_falha.append((inv_id, "ERRO_API", str(e)[:200]))
+                    continue
+
+                if not dados:
+                    print(f"  [{etq}] sem leitura valida (Canadian sem realData)")
+                    n_pulado += 1
+                    inv_falha.append((inv_id, "SEM_LEITURA",
+                                      "Canadian sem leitura no dispositivo"))
+                    continue
+
+                status, campos, mppts, strings = canadian.extrair_dados(
+                    dados, topo, online)
+
+                # A Canadian entrega lastReportTime em UTC; se vier vazio,
+                # cai no slot atual (BR -> UTC). Trunca ao slot de 5 min.
+                if ts_utc is not None:
+                    ts_grava = truncar_slot_5min(ts_utc)
+                else:
+                    ts_grava = truncar_slot_5min(agora_br + timedelta(hours=3))
+
+                gravar_leitura(cur, inv_id, ts_grava, status,
+                               campos, mppts, strings)
+                total_pac += campos["pac_kw"]
+                inv_ok.add(inv_id)   # leu com sucesso -> fecha episodio de falha
+                if status == "ONLINE":
+                    n_online += 1
+
+                ts_grava_br = ts_grava - timedelta(hours=3)
+                print(f"  [{etq}] {status} | Canadian | "
+                      f"slot {ts_grava_br:%H:%M} BR | "
+                      f"Pac: {campos['pac_kw']:.2f} kW")
+                continue
+
+            # ---------------------------------------------------------------
+            # Ramo Chint (fonte='chint', o padrao) — INALTERADO.
+            # ---------------------------------------------------------------
             if not asset_id:
                 print(f"  [{etq}] ERRO: sem asset_id cadastrado (nao da pra "
                       f"buscar na Chint).")
