@@ -962,51 +962,51 @@ def main():
             # Mesma semantica de contadores e falhas da Chint; ao final,
             # 'continue' (o resto do laço e exclusivo da Chint).
             # ---------------------------------------------------------------
-            if (fonte or "chint") == "canadian":
-                if not serial_sn:
-                    print(f"  [{etq}] ERRO: sem serial_sn cadastrado (nao da "
-                          f"pra buscar na Canadian).")
-                    n_erro += 1
-                    continue
-
-                try:
-                    ts_utc, dados, online = canadian.buscar_realtime(serial_sn)
-                except Exception as e:
-                    print(f"  [{etq}] ERRO de API (Canadian): {e}")
-                    n_erro += 1
-                    # falha de conexao/API -> possivel queda de internet
-                    inv_falha.append((inv_id, "ERRO_API", str(e)[:200]))
-                    continue
-
-                if not dados:
-                    print(f"  [{etq}] sem leitura valida (Canadian sem realData)")
-                    n_pulado += 1
-                    inv_falha.append((inv_id, "SEM_LEITURA",
-                                      "Canadian sem leitura no dispositivo"))
-                    continue
-
-                status, campos, mppts, strings = canadian.extrair_dados(
-                    dados, topo, online)
-
-                # A Canadian entrega lastReportTime em UTC; se vier vazio,
-                # cai no slot atual (BR -> UTC). Trunca ao slot de 5 min.
-                if ts_utc is not None:
-                    ts_grava = truncar_slot_5min(ts_utc)
-                else:
-                    ts_grava = truncar_slot_5min(agora_br + timedelta(hours=3))
-
-                gravar_leitura(cur, inv_id, ts_grava, status,
-                               campos, mppts, strings)
-                total_pac += campos["pac_kw"]
-                inv_ok.add(inv_id)   # leu com sucesso -> fecha episodio de falha
-                if status == "ONLINE":
-                    n_online += 1
-
-                ts_grava_br = ts_grava - timedelta(hours=3)
-                print(f"  [{etq}] {status} | Canadian | "
-                      f"slot {ts_grava_br:%H:%M} BR | "
-                      f"Pac: {campos['pac_kw']:.2f} kW")
+            # ---- CANADIAN (Smart Energy) ----
+        if fonte == "canadian":
+            if not serial_sn:
+                print(f"  [{etq}] ERRO: sem serial_sn cadastrado.")
+                n_erro += 1
                 continue
+            try:
+                ts_dev, dados, online = canadian.buscar_realtime(serial_sn)
+            except Exception as e:
+                print(f"  [{etq}] ERRO de API (Canadian): {e}")
+                n_erro += 1
+                inv_falha.append((inv_id, "ERRO_API", str(e)[:200]))
+                continue
+            if not dados or ts_dev is None:
+                print(f"  [{etq}] sem leitura Canadian (sem realData/timestamp)")
+                n_pulado += 1
+                inv_falha.append((inv_id, "SEM_LEITURA", "Canadian sem dados"))
+                continue
+    
+            # A Canadian publica em intervalo IRREGULAR (nao exatamente 5/5 min).
+            # Gravamos SEMPRE a ultima leitura disponivel; se essa leitura ja foi
+            # registrada (o report nao avancou desde o ultimo ciclo), ignoramos —
+            # nao reescreve nem cria ponto falso.
+            ts_grava = truncar_slot_5min(ts_dev)
+            cur.execute("SELECT MAX(data_hora) FROM leitura WHERE inversor_id = %s",
+                        (inv_id,))
+            ultima = cur.fetchone()[0]
+            if ultima is not None and ts_grava <= ultima:
+                ts_br = ts_dev - timedelta(hours=3)
+                print(f"  [{etq}] sem novidade (report {ts_br:%H:%M:%S} BR ja "
+                      f"registrado) — pulado")
+                inv_ok.add(inv_id)   # leitura OK, so nao avancou -> NAO e falha
+                n_pulado += 1
+                continue
+    
+            status, campos, mppts, strings = canadian.extrair_dados(dados, topo, online)
+            gravar_leitura(cur, inv_id, ts_grava, status, campos, mppts, strings)
+            total_pac += campos["pac_kw"]
+            inv_ok.add(inv_id)
+            if status == "ONLINE":
+                n_online += 1
+            ts_br = ts_grava - timedelta(hours=3)
+            print(f"  [{etq}] {status} | canadian | slot {ts_br:%H:%M} BR | "
+                  f"Pac: {campos['pac_kw']:.2f} kW")
+            continue
 
             # ---------------------------------------------------------------
             # Ramo Chint (fonte='chint', o padrao) — INALTERADO.
