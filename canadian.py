@@ -213,7 +213,10 @@ def extrair_dados(dados, topologia, online=None):
             string_num += 1
             v = g(f"dv{entrada}")
             i = g(f"dc{entrada}")
-            p = g(f"dp{entrada}")
+            # dp{n} da API e a potencia do MPPT INTEIRO, nao da string —
+            # usa-la aqui dobra o valor. Potencia da string = tensao do
+            # MPPT x corrente da string. A potencia do MPPT vira a soma.
+            p = v * i
             strings.append({
                 "string_num": string_num,
                 "mppt": m,
