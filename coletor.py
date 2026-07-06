@@ -225,7 +225,20 @@ TITULOS_181 = [
     "Debug parameter 27", "Debug parameter 28", "Debug parameter 29",
 ]
 
-LAYOUTS_TITULOS = [TITULOS_125, TITULOS_181]
+# ------------------------------------------------------------
+# LAYOUT DE 126 COLUNAS — variante do de 125 com UMA coluna extra
+# logo antes do bloco de MPPTs. Capturado no feed real (ex.: asset
+# 67b7...200a): a row vinha com 126 colunas e casava por aproximacao
+# com o de 125 (diff=1), deslocando todo o bloco Umppt/Imppt/Ipv em
+# 1 posicao — a tensao do MPPT caia na coluna da corrente e vice-versa.
+# A coluna extra fica exatamente antes de 'Umppt1(V)'. Nao sabemos o
+# titulo oficial dela (nao lida por ninguem), entao entra como
+# reservada — a resolucao por TITULO dos demais campos volta a acertar.
+# ------------------------------------------------------------
+_ext = TITULOS_125.index("Umppt1(V)")
+TITULOS_126 = TITULOS_125[:_ext] + ["ReservedExtra126"] + TITULOS_125[_ext:]
+
+LAYOUTS_TITULOS = [TITULOS_125, TITULOS_126, TITULOS_181]
 
 
 # ============================================================
@@ -428,6 +441,34 @@ def extrair_dados(row, topologia, titulos):
 
     status = "ONLINE" if campos["pac_kw"] > 0 else "OFFLINE"
     return status, campos, mppts, strings
+
+
+def recompor_corrente_mppt_por_strings(mppts, strings):
+    """Recalcula a corrente (e a potencia) de cada MPPT como a SOMA das
+    correntes de suas strings-filhas, agrupando pelo campo 'mppt' de cada
+    string. Topologia-agnostico: funciona com 1, 2, 3... strings por MPPT,
+    simetrico ou nao — quem define a filiacao e o proprio dado (s['mppt']).
+
+    USO: inversores cuja API NAO reporta a corrente do MPPT diretamente
+    (ex.: Canadian / Smart Energy). Sem isso, a corrente do MPPT acaba
+    espelhando so a 1a string do par, e o card sai duplicado.
+
+    Seguro: so mexe num MPPT que TEM strings no lote; se um MPPT nao tiver
+    string alguma (lote incompleto), o valor original e preservado.
+    A tensao NAO e tocada (ela ja vem correta da leitura)."""
+    soma_por_mppt = {}
+    for s in strings:
+        m = s.get("mppt")
+        if m is None:
+            continue
+        soma_por_mppt[m] = soma_por_mppt.get(m, 0.0) + s.get("corrente_a", 0.0)
+
+    for c in mppts:
+        i = soma_por_mppt.get(c["mppt"])
+        if i is not None:
+            c["corrente_a"] = i
+            c["potencia_w"] = c["tensao_v"] * i
+    return mppts
 
 
 def canais_zerados(topologia):
@@ -998,6 +1039,11 @@ def main():
                     continue
     
                 status, campos, mppts, strings = canadian.extrair_dados(dados, topo, online)
+                # A API Canadian nao reporta a corrente do MPPT diretamente:
+                # cada MPPT recebe a corrente = SOMA das suas strings-filhas
+                # (topologia vem do banco via topo['strings_por_mppt']). Sem
+                # isto, o MPPT espelha so a 1a string e o card sai duplicado.
+                mppts = recompor_corrente_mppt_por_strings(mppts, strings)
                 gravar_leitura(cur, inv_id, ts_grava, status, campos, mppts, strings)
                 total_pac += campos["pac_kw"]
                 inv_ok.add(inv_id)
