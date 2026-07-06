@@ -195,30 +195,45 @@ def extrair_dados(dados, topologia, online=None):
         "pdc_kw":     g("dp_all"),     # Potencia CC total (kW)
     }
 
-    # MPPTs: dv{n}=tensao(V), dc{n}=corrente(A), dp{n}=potencia(W)
+    # A API Canadian entrega por ENTRADA (dv/dc/dp{n}), UMA POR STRING —
+    # ex.: 12 MPPT x 2 strings = 24 entradas dv1..dv24. As duas strings de
+    # um mesmo MPPT compartilham a tensao. Percorre a topologia do banco
+    # (quantas strings cada MPPT tem) casando cada string com a proxima
+    # entrada; o MPPT recebe tensao da string e corrente/potencia = SOMA.
+    strings = []
+    entrada    = 0   # indice global da entrada na API (1..num_string)
+    string_num = 0
+    i_por_mppt = {}  # soma de corrente por MPPT
+    p_por_mppt = {}  # soma de potencia por MPPT
+    v_por_mppt = {}  # tensao do MPPT (compartilhada pelas strings)
+    for m in range(1, num_mppt + 1):
+        qtd = topologia["strings_por_mppt"].get(m, 0)
+        for _ in range(qtd):
+            entrada    += 1
+            string_num += 1
+            v = g(f"dv{entrada}")
+            i = g(f"dc{entrada}")
+            p = g(f"dp{entrada}")
+            strings.append({
+                "string_num": string_num,
+                "mppt": m,
+                "corrente_a": i,
+                "potencia_w": p,
+            })
+            i_por_mppt[m] = i_por_mppt.get(m, 0.0) + i
+            p_por_mppt[m] = p_por_mppt.get(m, 0.0) + p
+            if v > 0:
+                v_por_mppt[m] = v
+
+    # MPPTs: tensao das strings (compartilhada); corrente/potencia = SOMA.
     mppts = []
     for m in range(1, num_mppt + 1):
         mppts.append({
             "mppt": m,
-            "tensao_v":   g(f"dv{m}"),
-            "corrente_a": g(f"dc{m}"),
-            "potencia_w": g(f"dp{m}"),   # ja em W
+            "tensao_v":   v_por_mppt.get(m, 0.0),
+            "corrente_a": i_por_mppt.get(m, 0.0),
+            "potencia_w": p_por_mppt.get(m, 0.0),   # ja em W
         })
-
-    # Strings: conforme a topologia (1 por MPPT no modelo Canadian).
-    # A API entrega por ENTRADA (dv/dc/dp), entao a string herda a entrada.
-    strings = []
-    string_num = 0
-    for m in range(1, num_mppt + 1):
-        qtd = topologia["strings_por_mppt"].get(m, 0)
-        for _ in range(qtd):
-            string_num += 1
-            strings.append({
-                "string_num": string_num,
-                "mppt": m,
-                "corrente_a": g(f"dc{m}"),
-                "potencia_w": g(f"dp{m}"),
-            })
 
     status = "ONLINE" if (campos["pac_kw"] > 0 or online) else "OFFLINE"
     return status, campos, mppts, strings
