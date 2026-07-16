@@ -85,6 +85,12 @@ import psycopg
 # para o MESMO (status, campos, mppts, strings) que a gravar_leitura() usa.
 import canadian
 
+# Adaptador da plataforma FusionSolar / SmartPVMS (Huawei). Mesma ideia do
+# canadian.py: fala com a API Northbound e traduz para o MESMO formato. A
+# leitura Huawei e PRE-CARREGADA em lote (1 chamada para todos os inversores)
+# antes do laco, por causa do flow control da Huawei.
+import huawei
+
 
 # ============================================================
 # CONFIGURACAO — lida do ambiente (Railway)
@@ -951,12 +957,13 @@ def main():
         # Seleciona inversores de TODAS as fontes (nao filtra por 'fonte' no
         # SQL): o laço roteia por i.fonte. i.serial_sn e usado pelo ramo
         # Canadian (identifica o dispositivo na API Smart Energy); i.asset_id
-        # continua sendo o identificador do ramo Chint.
+        # continua sendo o identificador do ramo Chint; i.device_id guarda o
+        # devId da FusionSolar (ramo Huawei).
         if _COLETAR_TODAS:
             cur.execute(
                 """
                 SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina,
-                       i.fonte, i.serial_sn
+                       i.fonte, i.serial_sn, i.device_id
                 FROM inversor i
                 JOIN usina u ON u.id = i.usina_id
                 ORDER BY u.id, i.idx
@@ -966,7 +973,7 @@ def main():
             cur.execute(
                 """
                 SELECT i.id, i.nome, i.asset_id, i.modelo_id, u.slug AS usina,
-                       i.fonte, i.serial_sn
+                       i.fonte, i.serial_sn, i.device_id
                 FROM inversor i
                 JOIN usina u ON u.id = i.usina_id
                 WHERE u.slug = %s
@@ -989,7 +996,26 @@ def main():
         inv_ok    = set()   # inversores que LERAM neste ciclo
         inv_falha = []      # (inv_id, codigo, descricao) p/ alarme de leitura
 
-        for inv_id, nome, asset_id, modelo_id, usina, fonte, serial_sn in inversores:
+        # ---------------------------------------------------------------
+        # PRE-CARGA HUAWEI (em lote, ANTES do laço).
+        # O getDevRealKpi aceita ate 100 dispositivos do mesmo devTypeId por
+        # chamada e a Huawei faz flow control por nº de dispositivos a cada
+        # 5 min. Uma chamada unica para todos os inversores Huawei evita o
+        # failCode 407 e economiza cota; o laço so le do cache.
+        # Se a pre-carga falhar, o ciclo continua: os Huawei caem em
+        # SEM_LEITURA e a Chint/Canadian seguem normalmente.
+        # ---------------------------------------------------------------
+        huawei_ids = [r[7] for r in inversores if r[5] == "huawei" and r[7]]
+        if huawei_ids:
+            try:
+                n_hw = huawei.precarregar(huawei_ids)
+                print(f"  Huawei: {n_hw}/{len(huawei_ids)} inversor(es) "
+                      f"pre-carregado(s) em 1 chamada.")
+            except Exception as e:
+                print(f"  AVISO: pre-carga Huawei falhou: {e}")
+
+        for (inv_id, nome, asset_id, modelo_id, usina,
+             fonte, serial_sn, device_id) in inversores:
             etq = f"{usina}/{nome}"   # ex.: "ibiracu/Inversor 1"
 
             topo = topologias.get(modelo_id)
@@ -1003,6 +1029,48 @@ def main():
             # Mesma semantica de contadores e falhas da Chint; ao final,
             # 'continue' (o resto do laço e exclusivo da Chint).
             # ---------------------------------------------------------------
+            # ---- HUAWEI (FusionSolar / SmartPVMS) ----
+            # Le do cache da pre-carga (nao faz chamada por inversor).
+            if fonte == "huawei":
+                if not device_id:
+                    print(f"  [{etq}] ERRO: sem device_id (devId da "
+                          f"FusionSolar) cadastrado.")
+                    n_erro += 1
+                    continue
+
+                dados, online = huawei.get_dev(device_id)
+                if not dados:
+                    print(f"  [{etq}] sem leitura Huawei (nao veio na pre-carga)")
+                    n_pulado += 1
+                    inv_falha.append((inv_id, "SEM_LEITURA",
+                                      "Huawei sem dataItemMap"))
+                    continue
+
+                # O getDevRealKpi NAO devolve timestamp (so devId/sn/
+                # dataItemMap). Quem carimba a hora e o coletor: o inversor
+                # publica a cada 5 min, entao o slot do ciclo e a referencia.
+                ts_grava = truncar_slot_5min(
+                    datetime.now(FUSO_BR).replace(tzinfo=None) + timedelta(hours=3))
+
+                status, campos, mppts, strings = huawei.extrair_dados(
+                    dados, topo, online)
+                # A Huawei nao reporta tensao/corrente por MPPT (so energia
+                # acumulada em mppt_{n}_cap). O adaptador traz a tensao das
+                # strings-filhas e aqui a corrente do MPPT vira a SOMA delas
+                # (topologia do banco: no SUN2000-250KTL-H1 sao 6 MPPTs com
+                # 4/5/5/4/5/5 strings = 28).
+                mppts = recompor_corrente_mppt_por_strings(mppts, strings)
+                gravar_leitura(cur, inv_id, ts_grava, status, campos,
+                               mppts, strings)
+                total_pac += campos["pac_kw"]
+                inv_ok.add(inv_id)
+                if status == "ONLINE":
+                    n_online += 1
+                ts_br = ts_grava - timedelta(hours=3)
+                print(f"  [{etq}] {status} | huawei | slot {ts_br:%H:%M} BR | "
+                      f"Pac: {campos['pac_kw']:.2f} kW")
+                continue
+
             # ---- CANADIAN (Smart Energy) ----
             if fonte == "canadian":
                 if not serial_sn:
