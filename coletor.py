@@ -91,6 +91,12 @@ import canadian
 # antes do laco, por causa do flow control da Huawei.
 import huawei
 
+# Adaptador da plataforma SOLARMAN (globalapi.solarmanpv.com). Mesma ideia
+# dos anteriores. ATENCAO: a Solarman entrega POTENCIA EM WATTS (o adaptador
+# ja divide por 1000). Este equipamento nao reporta DC/strings — o card do
+# dashboard oculta essa secao quando isso acontece.
+import solarman
+
 
 # ============================================================
 # CONFIGURACAO — lida do ambiente (Railway)
@@ -1119,6 +1125,44 @@ def main():
                     n_online += 1
                 ts_br = ts_grava - timedelta(hours=3)
                 print(f"  [{etq}] {status} | canadian | slot {ts_br:%H:%M} BR | "
+                      f"Pac: {campos['pac_kw']:.2f} kW")
+                continue
+
+            # ---- SOLARMAN (Open API) ----
+            if fonte == "solarman":
+                if not serial_sn:
+                    print(f"  [{etq}] ERRO: sem serial_sn cadastrado.")
+                    n_erro += 1
+                    continue
+                try:
+                    dados, online = solarman.buscar_realtime(serial_sn)
+                except Exception as e:
+                    print(f"  [{etq}] ERRO de API (Solarman): {e}")
+                    n_erro += 1
+                    inv_falha.append((inv_id, "ERRO_API", str(e)[:200]))
+                    continue
+                if not dados:
+                    print(f"  [{etq}] sem leitura Solarman (dataList vazio)")
+                    n_pulado += 1
+                    inv_falha.append((inv_id, "SEM_LEITURA", "Solarman sem dataList"))
+                    continue
+
+                # O currentData devolve o snapshot atual sem timestamp
+                # confiavel, entao quem carimba a hora e o coletor (como no
+                # ramo Huawei): o slot de 5 min do ciclo.
+                ts_grava = truncar_slot_5min(
+                    datetime.now(FUSO_BR).replace(tzinfo=None) + timedelta(hours=3))
+
+                status, campos, mppts, strings = solarman.extrair_dados(
+                    dados, topo, online)
+                gravar_leitura(cur, inv_id, ts_grava, status, campos,
+                               mppts, strings)
+                total_pac += campos["pac_kw"]
+                inv_ok.add(inv_id)
+                if status == "ONLINE":
+                    n_online += 1
+                ts_br = ts_grava - timedelta(hours=3)
+                print(f"  [{etq}] {status} | solarman | slot {ts_br:%H:%M} BR | "
                       f"Pac: {campos['pac_kw']:.2f} kW")
                 continue
 
