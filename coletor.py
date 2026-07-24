@@ -97,6 +97,12 @@ import huawei
 # dashboard oculta essa secao quando isso acontece.
 import solarman
 
+# Adaptador da plataforma SOLISCLOUD (Solis/Ginlong). Autenticacao por
+# ASSINATURA HMAC-SHA1 por requisicao (sem token). ATENCAO: a Solis muda a
+# UNIDADE da energia conforme a grandeza (kWh/MWh/GWh) — o adaptador
+# normaliza tudo para kWh lendo o campo de unidade.
+import solis
+
 
 # ============================================================
 # CONFIGURACAO — lida do ambiente (Railway)
@@ -1163,6 +1169,44 @@ def main():
                     n_online += 1
                 ts_br = ts_grava - timedelta(hours=3)
                 print(f"  [{etq}] {status} | solarman | slot {ts_br:%H:%M} BR | "
+                      f"Pac: {campos['pac_kw']:.2f} kW")
+                continue
+
+            # ---- SOLIS (SolisCloud) ----
+            if fonte == "solis":
+                if not serial_sn:
+                    print(f"  [{etq}] ERRO: sem serial_sn cadastrado.")
+                    n_erro += 1
+                    continue
+                try:
+                    ts_dev, dados, online = solis.buscar_realtime(serial_sn)
+                except Exception as e:
+                    print(f"  [{etq}] ERRO de API (Solis): {e}")
+                    n_erro += 1
+                    inv_falha.append((inv_id, "ERRO_API", str(e)[:200]))
+                    continue
+                if not dados:
+                    print(f"  [{etq}] sem leitura Solis (data vazio)")
+                    n_pulado += 1
+                    inv_falha.append((inv_id, "SEM_LEITURA", "Solis sem data"))
+                    continue
+
+                # A Solis devolve dataTimestamp (epoch ms). Se vier, usamos
+                # como referencia; senao, o relogio do coletor.
+                base_ts = ts_dev or (datetime.now(FUSO_BR).replace(tzinfo=None)
+                                     + timedelta(hours=3))
+                ts_grava = truncar_slot_5min(base_ts)
+
+                status, campos, mppts, strings = solis.extrair_dados(
+                    dados, topo, online)
+                gravar_leitura(cur, inv_id, ts_grava, status, campos,
+                               mppts, strings)
+                total_pac += campos["pac_kw"]
+                inv_ok.add(inv_id)
+                if status == "ONLINE":
+                    n_online += 1
+                ts_br = ts_grava - timedelta(hours=3)
+                print(f"  [{etq}] {status} | solis | slot {ts_br:%H:%M} BR | "
                       f"Pac: {campos['pac_kw']:.2f} kW")
                 continue
 
