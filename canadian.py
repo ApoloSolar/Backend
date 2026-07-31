@@ -161,6 +161,91 @@ def buscar_realtime(serial_sn, tentativas=3, backoff=3):
 
 
 # ------------------------------------------------------------
+# Alarmes — /open-api/alert/alerthis/pageV2
+# ------------------------------------------------------------
+def _parse_dt_canadian(s):
+    """Converte a data-hora dos alarmes (UTC) em datetime naive."""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def buscar_alarmes(serial_sn, begin, end, tentativas=3, backoff=3):
+    """Busca o historico de alarmes de 1 inversor no intervalo [begin, end]
+    (date). Retorna lista NORMALIZADA de dicts:
+      {id, codigo, rotulo, descricao, inicio(dt), fim(dt|None), brutos}
+    O coletor grava isso na tabela 'alarmes' com origem='canadian'."""
+    token = obter_token()
+    # startTime/endTime no formato yyyyMMddHH
+    st = begin.strftime("%Y%m%d") + "00"
+    et = end.strftime("%Y%m%d") + "23"
+
+    registros = []
+    page = 1
+    while True:
+        params = {
+            "startTime": st, "endTime": et,
+            "page": str(page), "size": "100",
+            "deviceSn": serial_sn,
+        }
+
+        b = None
+        ultimo = None
+        for tentativa in range(1, tentativas + 1):
+            token = obter_token(forcar=(tentativa == tentativas))
+            try:
+                b = _get("/open-api/alert/alerthis/pageV2", params, token)
+                break
+            except Exception as e:
+                ultimo = f"conexao: {e}"
+                time.sleep(backoff)
+        if b is None:
+            raise ValueError(f"alerthis Canadian falhou ({ultimo})")
+
+        code = b.get("code")
+        msg = (b.get("msg") or "")
+        if code in (401, 508) or "token" in msg.lower():
+            obter_token(forcar=True)
+            continue
+        if code not in (0, 200):
+            # 603 = "No Record Response" -> sem alarmes, nao e erro
+            if code == 603:
+                break
+            raise ValueError(f"alerthis Canadian erro: code={code} msg={msg}")
+
+        data = b.get("data") or {}
+        recs = data.get("records") or []
+        for r in recs:
+            ini = _parse_dt_canadian(r.get("startTime"))
+            fim = _parse_dt_canadian(r.get("endTime"))
+            if ini is None:
+                continue
+            aid = r.get("alertId")
+            registros.append({
+                "id":        f"canadian:{aid}",
+                "codigo":    str(r.get("alertCode") or ""),
+                "rotulo":    "ERRO",
+                "descricao": r.get("alertName") or "",
+                "inicio":    ini,
+                "fim":       fim,
+                "brutos":    r,
+            })
+
+        total_pages = data.get("totalPages") or 1
+        if page >= total_pages:
+            break
+        page += 1
+        if page > 20:
+            break
+    return registros
+
+
+# ------------------------------------------------------------
 # Traducao para o formato do coletor
 # ------------------------------------------------------------
 def _freq(dados):
