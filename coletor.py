@@ -907,13 +907,86 @@ def _registrar_falhas_coletor(cur, inv_falha, inv_ok, slot_utc):
         )
 
 
+def _gravar_alarmes_generico(cur, origem, usina_id, inversor_id, device_sn, registros):
+    """UPSERT de alarmes ja NORMALIZADOS (Solis/Canadian). Cada registro:
+    {id, codigo, rotulo, descricao, inicio(dt), fim(dt|None), brutos}.
+    Modelado como EPISODIO (inicio_em/fim_em), igual ao coletor."""
+    for rec in registros:
+        aid = rec.get("id")
+        ini = rec.get("inicio")
+        if not aid or ini is None:
+            continue
+        cur.execute(
+            """
+            INSERT INTO alarmes
+                (id, origem, usina_id, inversor_id, device_sn,
+                 ocorrido_em, inicio_em, fim_em,
+                 error_type, codigo, descricao, checked, dados_brutos)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,false,%s::jsonb)
+            ON CONFLICT (id) DO UPDATE SET
+                fim_em        = EXCLUDED.fim_em,
+                descricao     = EXCLUDED.descricao,
+                dados_brutos  = EXCLUDED.dados_brutos,
+                inversor_id   = COALESCE(alarmes.inversor_id, EXCLUDED.inversor_id),
+                atualizado_em = now()
+            """,
+            (
+                aid, origem, usina_id, inversor_id, device_sn,
+                ini, ini, rec.get("fim"),
+                rec.get("rotulo") or "ERRO", rec.get("codigo") or "",
+                rec.get("descricao") or "",
+                json.dumps(rec.get("brutos"), ensure_ascii=False, default=str),
+            ),
+        )
+
+
+def coletar_alarmes_fabricantes(cur, agora_br):
+    """Alarmes de Solis e Canadian, buscados POR INVERSOR (serial_sn).
+    Cada fabricante tem seu proprio endpoint de alarmes; o resultado ja
+    vem normalizado pelos adaptadores e e gravado por _gravar_alarmes_generico."""
+    cur.execute(
+        """
+        SELECT i.id, i.serial_sn, i.usina_id, i.fonte, u.slug
+        FROM inversor i
+        JOIN usina u ON u.id = i.usina_id
+        WHERE i.fonte IN ('solis', 'canadian')
+          AND i.serial_sn IS NOT NULL AND i.serial_sn <> ''
+        ORDER BY u.id, i.idx
+        """
+    )
+    inversores = cur.fetchall()
+    if not inversores:
+        return
+
+    fim   = agora_br.date()
+    begin = fim - timedelta(days=DIAS_ALARMES)
+
+    adaptadores = {"solis": solis, "canadian": canadian}
+    for inv_id, sn, usina_id, fonte, slug in inversores:
+        mod = adaptadores.get(fonte)
+        if mod is None:
+            continue
+        try:
+            regs = mod.buscar_alarmes(sn, begin, fim)
+            _gravar_alarmes_generico(cur, fonte, usina_id, inv_id, sn, regs)
+            print(f"  Alarmes {fonte} [{slug}/{sn}]: {len(regs)} registro(s).")
+        except Exception as e:
+            print(f"  AVISO: alarmes {fonte} [{slug}/{sn}] falhou: {e}")
+
+
 def coletar_alarmes(cur, inv_falha, inv_ok, slot_utc, agora_br):
     """Roda ao fim do ciclo: episodios de falha (sempre) + alarmes da
-    Chint (para cada usina que tiver site_id)."""
+    Chint (por usina com site_id) + alarmes de Solis/Canadian (por inversor)."""
     # 1) falhas de leitura — nao dependem da Chint
     _registrar_falhas_coletor(cur, inv_falha, inv_ok, slot_utc)
 
-    # 2) alarmes da Chint, por usina com site_id
+    # 2) alarmes de Solis e Canadian (por inversor, via serial_sn)
+    try:
+        coletar_alarmes_fabricantes(cur, agora_br)
+    except Exception as e:
+        print(f"  AVISO: alarmes Solis/Canadian falharam: {e}")
+
+    # 3) alarmes da Chint, por usina com site_id
     cur.execute("SELECT id, slug, site_id FROM usina "
                 "WHERE site_id IS NOT NULL AND site_id <> ''")
     usinas = cur.fetchall()
