@@ -178,6 +178,72 @@ def buscar_realtime(serial_sn, tentativas=3, backoff=4):
 
 
 # ------------------------------------------------------------
+# Alarmes — /v1/api/alarmList
+# ------------------------------------------------------------
+def buscar_alarmes(serial_sn, begin, end, tentativas=3, backoff=4):
+    """Busca os alarmes de 1 inversor no intervalo [begin, end] (date).
+    Retorna lista NORMALIZADA de dicts:
+      {id, codigo, rotulo, descricao, inicio(dt UTC naive), fim(dt|None), brutos}
+    O coletor grava isso na tabela 'alarmes' com origem='solis'."""
+    if not SOLIS_KEY_ID or not SOLIS_SECRET:
+        raise ValueError("SOLIS_KEY_ID / SOLIS_KEY_SECRET nao configurados.")
+
+    registros = []
+    page = 1
+    while True:
+        payload = {
+            "pageNo": str(page),
+            "pageSize": "100",
+            "alarmDeviceSn": serial_sn,
+            "alarmBeginTime": begin.isoformat(),  # yyyy-MM-dd
+            "alarmEndTime": end.isoformat(),
+        }
+
+        b = None
+        ultimo = None
+        for tentativa in range(1, tentativas + 1):
+            prefixo = "API " if tentativa < tentativas else "API_"
+            try:
+                b = _chamar("/v1/api/alarmList", payload, prefixo)
+                break
+            except Exception as e:
+                ultimo = f"conexao: {e}"
+                time.sleep(backoff)
+        if b is None:
+            raise ValueError(f"alarmList Solis falhou ({ultimo})")
+
+        code = str(b.get("code"))
+        if code not in ("0", "200", "None"):
+            raise ValueError(f"alarmList Solis erro: code={code} msg={b.get('msg')}")
+
+        data = b.get("data") or {}
+        recs = data.get("records") or []
+        for r in recs:
+            ini_ms = _safe_float(r.get("alarmBeginTime"))
+            fim_ms = _safe_float(r.get("alarmEndTime"))
+            ini = datetime.utcfromtimestamp(ini_ms / 1000.0) if ini_ms > 0 else None
+            fim = datetime.utcfromtimestamp(fim_ms / 1000.0) if fim_ms > 0 else None
+            if ini is None:
+                continue
+            registros.append({
+                "id":        f"solis:{serial_sn}:{int(ini_ms)}",
+                "codigo":    str(r.get("alarmCode") or ""),
+                "rotulo":    "ERRO",
+                "descricao": r.get("alarmMsg") or r.get("advice") or "",
+                "inicio":    ini,
+                "fim":       fim,
+                "brutos":    r,
+            })
+
+        if len(recs) < 100:
+            break
+        page += 1
+        if page > 20:
+            break
+    return registros
+
+
+# ------------------------------------------------------------
 # Traducao para o formato do coletor
 # ------------------------------------------------------------
 def extrair_dados(dados, topologia, online=None):
